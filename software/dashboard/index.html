@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Smart Agricultural System</title>
+<style>
+:root{
+  --primary:#2c3e50;--secondary:#3498db;--accent:#e74c3c;--light:#ecf0f1;--dark:#2c3e50;--success:#27ae60;
+}
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;margin:0;background:#f5f5f5;color:var(--dark)}
+.container{max-width:980px;margin:0 auto;padding:16px}
+header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:22px;border-radius:14px;margin:10px 0;text-align:center}
+.grid{display:grid;gap:16px}
+@media(min-width:860px){.grid{grid-template-columns:2fr 1fr}}
+.card{background:#fff;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,.08);padding:16px}
+.card h2{margin:0 0 10px 0}
+.sensor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.sensor-box{background:var(--light);border-radius:10px;padding:12px;text-align:center}
+.sensor-name{font-weight:600}
+.sensor-value{font-size:26px;font-weight:800;margin:8px 0}
+.status{padding:10px;border-radius:8px;margin:8px 0;font-weight:700;text-align:center}
+.status-auto{background:#d5f5e3;color:var(--success)}
+.status-manual{background:#fdebd0;color:#e67e22}
+.status-on{background:#d5f5e3;color:#27ae60}
+.status-off{background:#fadbd8;color:#c0392b}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.btn{padding:10px 16px;border:none;border-radius:8px;cursor:pointer;font-weight:700;transition:transform .1s ease,opacity .1s ease}
+.btn:active{transform:scale(.98)}
+.btn-primary{background:var(--secondary);color:#fff}
+.btn-danger{background:var(--accent);color:#fff}
+.btn-success{background:var(--success);color:#fff}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.input{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px}
+.notice{font-size:12px;opacity:.7}
+.kv{display:flex;justify-content:space-between;margin:6px 0}
+.badge{display:inline-block;background:#eef;border-radius:999px;padding:6px 10px;font-weight:700}
+.small{font-size:12px}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <h1>Smart Agricultural System</h1>
+    <div class="small">DHT11 + Soil Moisture + Relay • with Live Weather (OpenWeatherMap)</div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Field Sensors</h2>
+      <div class="sensor-grid">
+        <div class="sensor-box">
+          <div class="sensor-name">Temperature</div>
+          <div class="sensor-value" id="temperature">--</div>
+          <div class="sensor-unit">°C</div>
+        </div>
+        <div class="sensor-box">
+          <div class="sensor-name">Humidity</div>
+          <div class="sensor-value" id="humidity">--</div>
+          <div class="sensor-unit">%</div>
+        </div>
+        <div class="sensor-box">
+          <div class="sensor-name">Soil Moisture</div>
+          <div class="sensor-value" id="moisture">--</div>
+          <div class="sensor-unit">%</div>
+        </div>
+      </div>
+
+      <div class="status" id="system-status">System Status: Loading...</div>
+      <div class="status" id="relay-status">Motor Status: Loading...</div>
+
+      <div class="controls">
+        <button class="btn btn-primary" id="water-on">Turn Water ON</button>
+        <button class="btn btn-danger"  id="water-off">Turn Water OFF</button>
+        <button class="btn btn-success" id="auto-mode">Auto Mode: ON</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Local Weather</h2>
+      <div class="kv"><span>Location</span><span class="badge" id="w-name">—</span></div>
+      <div class="kv"><span>Conditions</span><span id="w-desc">—</span></div>
+      <div class="kv"><span>Temperature</span><span id="w-temp">—</span></div>
+      <div class="kv"><span>Humidity</span><span id="w-hum">—</span></div>
+      <div class="controls" style="margin-top:10px">
+        <button class="btn btn-primary" id="w-refresh">Refresh Weather</button>
+      </div>
+      <div class="notice">Auto-updates every 10 minutes.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Settings</h2>
+    <div class="form-row">
+      <div>
+        <label>Moisture Threshold (%)</label>
+        <input id="moisture-threshold" class="input" type="number" step="1" min="0" max="100" />
+      </div>
+      <div>
+        <label>Humidity Alert Threshold (%)</label>
+        <input id="humidity-threshold" class="input" type="number" step="1" min="0" max="100" />
+      </div>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-success" id="save-settings">Save</button>
+    </div>
+    <div class="notice">Thresholds persist in device memory.</div>
+  </div>
+
+</div>
+
+<script>
+const temperatureEl = document.getElementById('temperature');
+const humidityEl    = document.getElementById('humidity');
+const moistureEl    = document.getElementById('moisture');
+const systemStatusEl= document.getElementById('system-status');
+const relayStatusEl = document.getElementById('relay-status');
+
+const waterOnBtn  = document.getElementById('water-on');
+const waterOffBtn = document.getElementById('water-off');
+const autoModeBtn = document.getElementById('auto-mode');
+
+const wName = document.getElementById('w-name');
+const wDesc = document.getElementById('w-desc');
+const wTemp = document.getElementById('w-temp');
+const wHum  = document.getElementById('w-hum');
+const wRefresh = document.getElementById('w-refresh');
+
+const moistInp = document.getElementById('moisture-threshold');
+const humInp   = document.getElementById('humidity-threshold');
+const saveBtn  = document.getElementById('save-settings');
+
+let moistureThreshold = 30;
+let humidityThreshold = 50;
+
+function updateSensorData(){
+  fetch('/sensor-data').then(r=>r.json()).then(d=>{
+    temperatureEl.textContent = (typeof d.temperature==='number') ? d.temperature.toFixed(1) : '--';
+    humidityEl.textContent    = (typeof d.humidity==='number')    ? d.humidity.toFixed(1)    : '--';
+    moistureEl.textContent    = (typeof d.moisture==='number')    ? d.moisture.toFixed(1)    : '--';
+  }).catch(()=>{});
+}
+
+function updateSystemStatus(){
+  fetch('/system-status').then(r=>r.json()).then(d=>{
+    systemStatusEl.textContent = `System Status: ${d.status}`;
+    systemStatusEl.className = `status ${d.status==='Auto'?'status-auto':'status-manual'}`;
+    relayStatusEl.textContent = `Motor Status: ${d.relay?'ON':'OFF'}`;
+    relayStatusEl.className   = `status ${d.relay?'status-on':'status-off'}`;
+    updateAutoModeButton(d.status==='Auto');
+  }).catch(()=>{});
+}
+
+function fetchWeather(){
+  fetch('/weather').then(r=>r.json()).then(w=>{
+    wName.textContent = w.name || '—';
+    wDesc.textContent = w.desc || '—';
+    wTemp.textContent = (typeof w.temp==='number') ? `${w.temp.toFixed(1)} °C` : '—';
+    wHum.textContent  = (typeof w.hum==='number')  ? `${w.hum.toFixed(0)} %`   : '—';
+  }).catch(()=>{});
+}
+
+function loadSettings(){
+  fetch('/settings').then(r=>r.json()).then(s=>{
+    moistureThreshold = s.moisture_threshold ?? 30;
+    humidityThreshold = s.humidity_threshold ?? 50;
+    moistInp.value = moistureThreshold;
+    humInp.value = humidityThreshold;
+  }).catch(()=>{});
+}
+
+function saveSettings(){
+  const body = {
+    moisture_threshold: parseFloat(moistInp.value||30),
+    humidity_threshold: parseFloat(humInp.value||50)
+  };
+  fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(_=>{
+      loadSettings();
+    });
+}
+
+function sendCommand(command){
+  fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command})})
+    .then(r=>r.json()).then(_=>{
+      updateSystemStatus();
+    });
+}
+
+function updateAutoModeButton(autoOn){ autoModeBtn.textContent = autoOn ? 'Auto Mode: ON' : 'Auto Mode: OFF'; }
+
+waterOnBtn.onclick = ()=>sendCommand('water_on');
+waterOffBtn.onclick= ()=>sendCommand('water_off');
+autoModeBtn.onclick= ()=>sendCommand('auto_mode');
+wRefresh.onclick   = ()=>fetchWeather();
+saveBtn.onclick    = ()=>saveSettings();
+
+function init(){
+  loadSettings();
+  updateSensorData();
+  updateSystemStatus();
+  fetchWeather();
+  setInterval(()=>{ updateSensorData(); updateSystemStatus(); }, 5000);
+  setInterval(()=>{ fetchWeather(); }, 600000);
+}
+init();
+</script>
+</body>
+</html>

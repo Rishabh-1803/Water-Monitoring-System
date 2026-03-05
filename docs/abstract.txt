@@ -1,0 +1,7 @@
+Abstract—
+
+Efficient water management is essential in agricultural and environmental applications, where improper irrigation can lead to water wastage and reduced productivity. Conventional manual monitoring methods are inefficient and lack real-time control. This paper presents the design and implementation of an ESP32-based IoT Water Monitoring System for automated monitoring and regulation of water flow. The proposed system employs an ESP32-C3 Super Mini microcontroller interfaced with a soil moisture sensor and a DHT11 temperature and humidity sensor to acquire real-time environmental data. Sensor readings are processed using predefined control logic to determine irrigation requirements. Based on the decision outcome, a 5 V relay module is activated to control a 12 V solenoid valve, enabling automatic regulation of water supply.
+
+The system architecture is structured into sensing, processing and control, and actuation layers, ensuring modularity and scalability. Experimental observations demonstrate reliable real-time monitoring and effective automated control of water flow under varying environmental conditions. The proposed system serves as a low-cost and practical platform for understanding IoT-based automation and embedded system design and is intended strictly for educational and academic applications, with scope for future enhancements such as cloud connectivity and secure data management.
+
+**Index Terms—**ESP32, Internet of Things, Water Monitoring System, Embedded Systems, Automation, Sensor Interfacing.
