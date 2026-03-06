@@ -24,8 +24,8 @@ Preferences preferences;
 AsyncWebServer server(80);
 
 // ====== WiFi ======
-char ssid[32]     = "Neel";
-char password[64] = "ryik4965";
+char ssid[32]     = "";  // SSID 
+char password[64] = "";  // Password 
 
 // ====== Control & Thresholds ======
 bool watering = false;
@@ -38,9 +38,9 @@ const int MOISTURE_DRY = 4095;   // ADC at fully dry
 const int MOISTURE_WET = 1500;   // ADC at fully wet
 
 // ====== OpenWeatherMap ======
-String apiKey       = "953a19ff6f2838448be6bd64f443ce3e";
-String city         = "Ahmedabad";
-String countryCode  = "IN";
+String apiKey       = "";  // API key
+String city         = "";  // City
+String countryCode  = "";  // Country code
 String weatherURL   = ""; // built in setup()
 
 String weatherDescription = "";
@@ -359,7 +359,7 @@ void setup() {
 
   // WiFi
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname("Neel");
+  WiFi.setHostname("Project");   // Project Name
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   unsigned long t0 = millis();
