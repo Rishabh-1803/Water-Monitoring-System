@@ -1,5 +1,18 @@
-// ====== Build Options ======
-#define BOARD_HAS_PSRAM 0  // Disable PSRAM for boards without it
+// =============================================================================
+// Smart Agricultural System - ESP32-C3 Super Mini
+// Water Monitoring + Auto Irrigation + Live Weather
+// -----------------------------------------------------------------------------
+// P0 FIXES APPLIED (see /CHANGELOG.md for full details):
+//   1. Race condition in /control POST body handler fixed (per-request buffer)
+//   2. DHT11 readings now cached in loop() instead of being read inside the
+//      HTTP handler (avoids stale/NaN data when polled faster than 2s)
+//   3. Removed meaningless `#define BOARD_HAS_PSRAM 0` (it has no effect in
+//      user code - that flag is a board-package build flag)
+//   4. Fixed misleading MOISTURE_PIN comment. On ESP32-C3, GPIO 1 IS a valid
+//      ADC1 channel (ADC1_CH1) - the value is correct, only the comment was wrong
+//   5. Added prominent API key rotation warning
+//   6. Added GPIO 8 strapping-pin warning (hardware note, no code change)
+// =============================================================================
 
 // ====== Includes ======
 #include <WiFi.h>
@@ -10,34 +23,45 @@
 #include <AsyncTCP.h>
 #include <DHT.h>
 #include <ESPmDNS.h>
-// #include "SPIFFS.h"      // Not used here
 
-// ====== Hardware Pins ======
-#define DHTPIN 4
+// ====== Hardware Pins (ESP32-C3 Super Mini) ======
+#define DHTPIN 4              // GPIO 4 = ADC1_CH4 on C3, OK for digital I/O too
 #define DHTTYPE DHT11
-#define MOISTURE_PIN  1     // ⚠️ Use an ADC1 pin (changed from 1)
-#define RELAY_PIN 8          // Active-LOW relay assumed
+#define MOISTURE_PIN 1        // GPIO 1 = ADC1_CH1 on ESP32-C3 (valid analog pin)
+#define RELAY_PIN 8           // GPIO 8 - see WARNING below
+//
+// !!! HARDWARE WARNING - GPIO 8 IS A STRAPPING PIN ON ESP32-C3 !!!
+// On ESP32-C3, GPIO 8 controls VDD_SPI voltage selection at boot.
+// If your relay module pulls this pin LOW at power-on (or it floats LOW),
+// the chip may enter an abnormal boot state or select wrong flash voltage.
+//
+// RECOMMENDED FIX (requires rewiring):
+//   Move RELAY_PIN to GPIO 5, 6, 7, or 10 (non-strapping, free pins).
+//   Then update #define RELAY_PIN 5 (or chosen pin) in this file.
+//
+// If you cannot rewire now, ensure the relay module has a pull-up on its
+// input (most modules do), and verify the board boots reliably before use.
 
 // ====== Objects ======
 DHT dht(DHTPIN, DHTTYPE);
 Preferences preferences;
 AsyncWebServer server(80);
 
-// ====== WiFi ======
+// ====== WiFi ================================================================
+// NOTE: Hardcoded credentials are committed in source - rotate them after
+// uploading to a private repo. A proper WiFiManager captive portal is the
+// long-term fix (tracked as P1, not yet implemented).
 char ssid[32]     = "Neel";
 char password[64] = "ryik4965";
 
-// ====== Control & Thresholds ======
-bool watering = false;
-bool autoMode = true;
-float moistureThreshold = 30.0f;  // %
-float humidityThreshold = 50.0f;  // % (for alerting only)
-
-// Calibrate these to your sensor
-const int MOISTURE_DRY = 4095;   // ADC at fully dry
-const int MOISTURE_WET = 1500;   // ADC at fully wet
-
-// ====== OpenWeatherMap ======
+// ====== OpenWeatherMap ======================================================
+// !!! SECURITY WARNING !!!
+// This API key is hardcoded in source. If this file has EVER been pushed to
+// GitHub (even a private repo) or shared, treat the key as COMPROMISED:
+//   1. Log in to https://home.openweathermap.org/api_keys
+//   2. Delete this key
+//   3. Generate a new one
+//   4. Store it in Preferences at runtime OR in a gitignored secrets.h file
 String apiKey       = "953a19ff6f2838448be6bd64f443ce3e";
 String city         = "Ahmedabad";
 String countryCode  = "IN";
@@ -50,6 +74,37 @@ String locationName = "—";
 
 unsigned long lastWeatherUpdate = 0;
 const unsigned long WEATHER_INTERVAL_MS = 600000UL; // 10 min
+
+// ====== Control & Thresholds ======
+bool watering = false;
+bool autoMode = true;
+float moistureThreshold = 30.0f;  // %
+float humidityThreshold = 50.0f;  // % (for alerting only)
+
+// Calibrate these to your sensor
+const int MOISTURE_DRY = 4095;   // ADC at fully dry
+const int MOISTURE_WET = 1500;   // ADC at fully wet
+
+// ====== DHT11 Reading Cache (P0 fix #2) =====================================
+// DHT11 has a minimum sampling interval of ~2 seconds. Reading it directly
+// inside the /sensor-data HTTP handler caused stale/NaN data when the UI
+// polled faster than 2s, or when multiple clients polled simultaneously.
+// We now sample in loop() and serve cached values.
+float  cachedTemp = NAN;
+float  cachedHum  = NAN;
+unsigned long lastDhtRead = 0;
+const unsigned long DHT_INTERVAL_MS = 2500UL; // > 2s per DHT11 datasheet
+
+void updateDhtCache() {
+  if (millis() - lastDhtRead < DHT_INTERVAL_MS) return;
+  lastDhtRead = millis();
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  // Only update cache if reading is valid (NaN readings do not overwrite
+  // the last known good value - this gives the UI a stable display)
+  if (!isnan(t)) cachedTemp = t;
+  if (!isnan(h)) cachedHum  = h;
+}
 
 // ====== HTML (single page app) ======
 const char index_html[] PROGMEM = R"rawliteral(
@@ -347,7 +402,7 @@ void setup() {
   digitalWrite(RELAY_PIN, HIGH); // relay OFF (active LOW)
 
   // Configure ADC for the moisture pin
-  analogReadResolution(12);                      // 12-bit resolution (0..4095)
+  analogReadResolution(12);                        // 12-bit resolution (0..4095)
   analogSetPinAttenuation(MOISTURE_PIN, ADC_11db); // allow full-scale up to ~3.3V
 
   // Preferences
@@ -378,18 +433,21 @@ void setup() {
   // Initial weather fetch (if online)
   getWeatherData();
 
+  // Prime the DHT cache before serving the first request
+  updateDhtCache();
+
   // ====== Routes ======
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", index_html);
   });
 
   server.on("/sensor-data", HTTP_GET, [](AsyncWebServerRequest *request){
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
+    // P0 fix #2: serve cached DHT values instead of reading the sensor here.
+    // Moisture is fast enough to sample on demand (8 ADC reads, ~2ms).
     float m = readMoisturePercent();
     DynamicJsonDocument doc(256);
-    if (!isnan(t)) doc["temperature"] = t; else doc["temperature"] = nullptr;
-    if (!isnan(h)) doc["humidity"] = h; else doc["humidity"] = nullptr;
+    if (!isnan(cachedTemp)) doc["temperature"] = cachedTemp; else doc["temperature"] = nullptr;
+    if (!isnan(cachedHum))  doc["humidity"]    = cachedHum;  else doc["humidity"]    = nullptr;
     doc["moisture"] = m;
     String out; serializeJson(doc, out);
     request->send(200, "application/json", out);
@@ -403,51 +461,56 @@ void setup() {
     request->send(200, "application/json", out);
   });
 
-  // Control (POST with raw JSON body)
-  server.on("/control", HTTP_POST,
-    [](AsyncWebServerRequest *request){},
-    NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      static String body;
-      if (index == 0) body = "";
-      body += String((char*)data).substring(0, len);
-      if (index + len != total) return;
-
-      DynamicJsonDocument doc(256);
-      if (deserializeJson(doc, body)) {
-        request->send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
-        return;
-      }
-      String command = doc["command"] | "";
-      preferences.begin("watering", false);
-
-      if (command == "water_on") {
-        watering = true; autoMode = false;
-        digitalWrite(RELAY_PIN, LOW);
-        preferences.putBool("automode", false);
-        preferences.end();
-        request->send(200, "application/json", "{\"success\":true}");
-      } else if (command == "water_off") {
-        watering = false; autoMode = false;
-        digitalWrite(RELAY_PIN, HIGH);
-        preferences.putBool("automode", false);
-        preferences.end();
-        request->send(200, "application/json", "{\"success\":true}");
-      } else if (command == "auto_mode") {
-        autoMode = !autoMode;
-        preferences.putBool("automode", autoMode);
-        preferences.end();
-        if (!autoMode) { watering = false; digitalWrite(RELAY_PIN, HIGH); }
-        DynamicJsonDocument res(128);
-        res["success"] = true; res["auto_mode"] = autoMode;
-        String out; serializeJson(res, out);
-        request->send(200, "application/json", out);
-      } else {
-        preferences.end();
-        request->send(400, "application/json", "{\"success\":false,\"error\":\"unknown command\"}");
-      }
+  // ===========================================================================
+  // P0 fix #1: Race condition in /control POST handler
+  // ---------------------------------------------------------------------------
+  // ORIGINAL BUG:
+  //   The onBody callback used a `static String body` that was shared across
+  //   all concurrent requests. Two simultaneous POSTs would corrupt each
+  //   other's buffer. Also `String((char*)data)` assumed null-termination,
+  //   which is not guaranteed for chunked bodies.
+  //
+  // FIX:
+  //   Use the same pattern as /settings POST below - the ESPAsyncWebServer
+  //   auto-buffers the body and exposes it via `request->arg("plain")`.
+  //   This is per-request (no shared state) and properly handles binary data.
+  // ===========================================================================
+  server.on("/control", HTTP_POST, [](AsyncWebServerRequest *request){
+    String body = request->arg("plain");
+    DynamicJsonDocument doc(256);
+    if (deserializeJson(doc, body)) {
+      request->send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
+      return;
     }
-  );
+    String command = doc["command"] | "";
+    preferences.begin("watering", false);
+
+    if (command == "water_on") {
+      watering = true; autoMode = false;
+      digitalWrite(RELAY_PIN, LOW);
+      preferences.putBool("automode", false);
+      preferences.end();
+      request->send(200, "application/json", "{\"success\":true}");
+    } else if (command == "water_off") {
+      watering = false; autoMode = false;
+      digitalWrite(RELAY_PIN, HIGH);
+      preferences.putBool("automode", false);
+      preferences.end();
+      request->send(200, "application/json", "{\"success\":true}");
+    } else if (command == "auto_mode") {
+      autoMode = !autoMode;
+      preferences.putBool("automode", autoMode);
+      preferences.end();
+      if (!autoMode) { watering = false; digitalWrite(RELAY_PIN, HIGH); }
+      DynamicJsonDocument res(128);
+      res["success"] = true; res["auto_mode"] = autoMode;
+      String out; serializeJson(res, out);
+      request->send(200, "application/json", out);
+    } else {
+      preferences.end();
+      request->send(400, "application/json", "{\"success\":false,\"error\":\"unknown command\"}");
+    }
+  });
 
   server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
     DynamicJsonDocument doc(128);
@@ -492,6 +555,9 @@ void setup() {
 
 // ====== Loop ======
 void loop() {
+  // P0 fix #2: sample DHT on a 2.5s cadence in loop(), not in HTTP handler.
+  updateDhtCache();
+
   // Auto watering logic with 5% hysteresis
   if (autoMode) {
     float moisture = readMoisturePercent();
