@@ -2,7 +2,7 @@
 // Smart Agricultural System - ESP32-C3 Super Mini
 // Water Monitoring + Auto Irrigation + Live Weather
 // -----------------------------------------------------------------------------
-// P0 FIXES APPLIED (see /CHANGELOG.md for full details):
+// FIXES APPLIED :
 //   1. Race condition in /control POST body handler fixed (per-request buffer)
 //   2. DHT11 readings now cached in loop() instead of being read inside the
 //      HTTP handler (avoids stale/NaN data when polled faster than 2s)
@@ -47,22 +47,10 @@ DHT dht(DHTPIN, DHTTYPE);
 Preferences preferences;
 AsyncWebServer server(80);
 
-// ====== WiFi ================================================================
-// NOTE: Hardcoded credentials are committed in source - rotate them after
-// uploading to a private repo. A proper WiFiManager captive portal is the
-// long-term fix (tracked as P1, not yet implemented).
-char ssid[32]     = "Neel";
-char password[64] = "ryik4965";
+char ssid[32]     = "";
+char password[64] = "";
 
-// ====== OpenWeatherMap ======================================================
-// !!! SECURITY WARNING !!!
-// This API key is hardcoded in source. If this file has EVER been pushed to
-// GitHub (even a private repo) or shared, treat the key as COMPROMISED:
-//   1. Log in to https://home.openweathermap.org/api_keys
-//   2. Delete this key
-//   3. Generate a new one
-//   4. Store it in Preferences at runtime OR in a gitignored secrets.h file
-String apiKey       = "953a19ff6f2838448be6bd64f443ce3e";
+String apiKey       = "";
 String city         = "Ahmedabad";
 String countryCode  = "IN";
 String weatherURL   = ""; // built in setup()
