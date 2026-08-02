@@ -2,7 +2,7 @@
 // Smart Agricultural System - ESP32-C3 Super Mini
 // Water Monitoring + Auto Irrigation + Live Weather
 // -----------------------------------------------------------------------------
-// FIXES APPLIED :
+// P0 FIXES APPLIED (see /CHANGELOG.md for full details):
 //   1. Race condition in /control POST body handler fixed (per-request buffer)
 //   2. DHT11 readings now cached in loop() instead of being read inside the
 //      HTTP handler (avoids stale/NaN data when polled faster than 2s)
