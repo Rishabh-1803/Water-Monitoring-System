@@ -7,6 +7,7 @@
 <style>
 :root{
   --primary:#2c3e50;--secondary:#3498db;--accent:#e74c3c;--light:#ecf0f1;--dark:#2c3e50;--success:#27ae60;
+  --warn:#e67e22;
 }
 *{box-sizing:border-box}
 body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;margin:0;background:#f5f5f5;color:var(--dark)}
@@ -22,7 +23,7 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 .sensor-value{font-size:26px;font-weight:800;margin:8px 0}
 .status{padding:10px;border-radius:8px;margin:8px 0;font-weight:700;text-align:center}
 .status-auto{background:#d5f5e3;color:var(--success)}
-.status-manual{background:#fdebd0;color:#e67e22}
+.status-manual{background:#fdebd0;color:var(--warn)}
 .status-on{background:#d5f5e3;color:#27ae60}
 .status-off{background:#fadbd8;color:#c0392b}
 .controls{display:flex;gap:10px;flex-wrap:wrap}
@@ -31,12 +32,15 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 .btn-primary{background:var(--secondary);color:#fff}
 .btn-danger{background:var(--accent);color:#fff}
 .btn-success{background:var(--success);color:#fff}
+.btn-warn{background:var(--warn);color:#fff}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .input{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px}
 .notice{font-size:12px;opacity:.7}
 .kv{display:flex;justify-content:space-between;margin:6px 0}
 .badge{display:inline-block;background:#eef;border-radius:999px;padding:6px 10px;font-weight:700}
 .small{font-size:12px}
+.warn-box{background:#fff3cd;border:1px solid #ffe69c;color:#664d03;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
+.danger-box{background:#f8d7da;border:1px solid #f1aeb5;color:#58151c;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 </style>
 </head>
 <body>
@@ -44,8 +48,18 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 
   <header>
     <h1>Smart Agricultural System</h1>
-    <div class="small">DHT11 + Soil Moisture + Relay • with Live Weather (OpenWeatherMap)</div>
+    <div class="small">ESP32-S3 • DHT11 + Soil Moisture + Relay • Live Weather (OpenWeatherMap)</div>
   </header>
+
+  <div id="safety-warn" class="danger-box" style="display:none">
+    <strong>Safety Trip:</strong> Pump was force-stopped after running longer than 5 minutes.
+    Auto-mode has been disabled. Check your moisture sensor and re-enable auto-mode manually.
+  </div>
+
+  <div id="default-creds-warn" class="warn-box" style="display:none">
+    <strong>Security Warning:</strong> Web UI is using default credentials (admin/admin).
+    Change them in the Configuration section below.
+  </div>
 
   <div class="grid">
     <div class="card">
@@ -87,7 +101,7 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
       <div class="controls" style="margin-top:10px">
         <button class="btn btn-primary" id="w-refresh">Refresh Weather</button>
       </div>
-      <div class="notice">Auto-updates every 10 minutes.</div>
+      <div class="notice">Auto-updates every 10 minutes. Requires API key (see Configuration).</div>
     </div>
   </div>
 
@@ -109,9 +123,53 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
     <div class="notice">Thresholds persist in device memory.</div>
   </div>
 
+  <div class="card">
+    <h2>Configuration</h2>
+    <div class="form-row">
+      <div>
+        <label>OpenWeatherMap API Key</label>
+        <input id="cfg-api-key" class="input" type="text" placeholder="Enter API key" />
+      </div>
+      <div>
+        <label>City</label>
+        <input id="cfg-city" class="input" type="text" placeholder="Ahmedabad" />
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Country Code (2 letters)</label>
+        <input id="cfg-country" class="input" type="text" maxlength="2" placeholder="IN" />
+      </div>
+      <div>
+        <label>Web UI Username</label>
+        <input id="cfg-auth-user" class="input" type="text" placeholder="admin" />
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>New Web UI Password (leave blank to keep current)</label>
+        <input id="cfg-auth-pass" class="input" type="password" placeholder="••••••" />
+      </div>
+      <div></div>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-success" id="save-config">Save Configuration</button>
+      <button class="btn btn-warn" id="reset-wifi">Reset WiFi Configuration</button>
+    </div>
+    <div class="notice">
+      API key and credentials are stored in device memory (NVS).<br>
+      "Reset WiFi Configuration" clears stored WiFi credentials and reboots
+      the device into the captive portal for reconfiguration.
+    </div>
+  </div>
+
 </div>
 
 <script>
+// P1-6: X-Requested-With header is sent on all POST requests to prevent CSRF.
+// The server rejects any POST without this header.
+const CSRF_HEADER = {'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'};
+
 const temperatureEl = document.getElementById('temperature');
 const humidityEl    = document.getElementById('humidity');
 const moistureEl    = document.getElementById('moisture');
@@ -132,6 +190,17 @@ const moistInp = document.getElementById('moisture-threshold');
 const humInp   = document.getElementById('humidity-threshold');
 const saveBtn  = document.getElementById('save-settings');
 
+const cfgApiKey = document.getElementById('cfg-api-key');
+const cfgCity   = document.getElementById('cfg-city');
+const cfgCountry= document.getElementById('cfg-country');
+const cfgAuthUser = document.getElementById('cfg-auth-user');
+const cfgAuthPass = document.getElementById('cfg-auth-pass');
+const saveCfgBtn = document.getElementById('save-config');
+const resetWifiBtn = document.getElementById('reset-wifi');
+
+const safetyWarn = document.getElementById('safety-warn');
+const defaultCredsWarn = document.getElementById('default-creds-warn');
+
 let moistureThreshold = 30;
 let humidityThreshold = 50;
 
@@ -150,6 +219,8 @@ function updateSystemStatus(){
     relayStatusEl.textContent = `Motor Status: ${d.relay?'ON':'OFF'}`;
     relayStatusEl.className   = `status ${d.relay?'status-on':'status-off'}`;
     updateAutoModeButton(d.status==='Auto');
+    if (d.safety_trip) safetyWarn.style.display = 'block';
+    else safetyWarn.style.display = 'none';
   }).catch(()=>{});
 }
 
@@ -176,17 +247,13 @@ function saveSettings(){
     moisture_threshold: parseFloat(moistInp.value||30),
     humidity_threshold: parseFloat(humInp.value||50)
   };
-  fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(r=>r.json()).then(_=>{
-      loadSettings();
-    });
+  fetch('/settings',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
+    .then(r=>r.json()).then(_=>{ loadSettings(); }).catch(()=>{});
 }
 
 function sendCommand(command){
-  fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command})})
-    .then(r=>r.json()).then(_=>{
-      updateSystemStatus();
-    });
+  fetch('/control',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify({command})})
+    .then(r=>r.json()).then(_=>{ updateSystemStatus(); }).catch(()=>{});
 }
 
 function updateAutoModeButton(autoOn){ autoModeBtn.textContent = autoOn ? 'Auto Mode: ON' : 'Auto Mode: OFF'; }
@@ -197,8 +264,59 @@ autoModeBtn.onclick= ()=>sendCommand('auto_mode');
 wRefresh.onclick   = ()=>fetchWeather();
 saveBtn.onclick    = ()=>saveSettings();
 
+function loadConfig(){
+  fetch('/config').then(r=>r.json()).then(c=>{
+    cfgApiKey.value    = c.api_key || '';
+    cfgCity.value      = c.city || '';
+    cfgCountry.value   = c.country || '';
+    cfgAuthUser.value  = c.auth_user || 'admin';
+    cfgAuthPass.value  = '';
+    if (c.auth_user === 'admin' && c.using_default_pass) {
+      defaultCredsWarn.style.display = 'block';
+    } else {
+      defaultCredsWarn.style.display = 'none';
+    }
+  }).catch(()=>{});
+}
+
+function saveConfig(){
+  const body = {
+    api_key:    cfgApiKey.value,
+    city:       cfgCity.value,
+    country:    cfgCountry.value.toUpperCase(),
+    auth_user:  cfgAuthUser.value
+  };
+  if (cfgAuthPass.value) body.auth_pass = cfgAuthPass.value;
+  fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if (d.success) {
+        alert('Configuration saved. If you changed the API key or city, weather will refresh shortly.');
+        if (d.rebuild_url) {
+          setTimeout(fetchWeather, 1500);
+        }
+        loadConfig();
+      } else {
+        alert('Failed to save: ' + (d.error || 'unknown error'));
+      }
+    }).catch(()=>{ alert('Network error saving config'); });
+}
+
+function resetWifi(){
+  if (!confirm('This will erase stored WiFi credentials and reboot the device into the captive portal. Continue?')) return;
+  fetch('/reset-wifi',{method:'POST',headers:CSRF_HEADER})
+    .then(r=>r.json()).then(d=>{
+      if (d.success) {
+        alert('Rebooting. Connect to the "SmartAgri-Setup" WiFi network to reconfigure.');
+      }
+    }).catch(()=>{});
+}
+
+saveCfgBtn.onclick = saveConfig;
+resetWifiBtn.onclick = resetWifi;
+
 function init(){
   loadSettings();
+  loadConfig();
   updateSensorData();
   updateSystemStatus();
   fetchWeather();
