@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Smart Agricultural System</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root{
   --primary:#2c3e50;--secondary:#3498db;--accent:#e74c3c;--light:#ecf0f1;--dark:#2c3e50;--success:#27ae60;
@@ -18,9 +19,11 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 .card{background:#fff;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,.08);padding:16px}
 .card h2{margin:0 0 10px 0}
 .sensor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
-.sensor-box{background:var(--light);border-radius:10px;padding:12px;text-align:center}
+.sensor-box{background:var(--light);border-radius:10px;padding:12px;text-align:center;position:relative}
 .sensor-name{font-weight:600}
 .sensor-value{font-size:26px;font-weight:800;margin:8px 0}
+.fault-badge{position:absolute;top:6px;right:6px;background:#c0392b;color:#fff;font-size:10px;padding:2px 6px;border-radius:999px;display:none}
+.fault-badge.show{display:inline-block}
 .status{padding:10px;border-radius:8px;margin:8px 0;font-weight:700;text-align:center}
 .status-auto{background:#d5f5e3;color:var(--success)}
 .status-manual{background:#fdebd0;color:var(--warn)}
@@ -38,9 +41,13 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 .notice{font-size:12px;opacity:.7}
 .kv{display:flex;justify-content:space-between;margin:6px 0}
 .badge{display:inline-block;background:#eef;border-radius:999px;padding:6px 10px;font-weight:700}
+.badge-rain{background:#aed6f1;color:#1b4f72}
+.badge-ok{background:#d5f5e3;color:#1e8449}
 .small{font-size:12px}
 .warn-box{background:#fff3cd;border:1px solid #ffe69c;color:#664d03;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 .danger-box{background:#f8d7da;border:1px solid #f1aeb5;color:#58151c;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
+.info-box{background:#d1ecf1;border:1px solid #bee5eb;color:#0c5460;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
+.chart-container{position:relative;height:300px}
 </style>
 </head>
 <body>
@@ -48,7 +55,8 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 
   <header>
     <h1>Smart Agricultural System</h1>
-    <div class="small">ESP32-S3 • DHT11 + Soil Moisture + Relay • Live Weather (OpenWeatherMap)</div>
+    <div class="small">ESP32-S3 • DHT11 + Soil Moisture + Relay • Live Weather + Trends + OTA</div>
+    <div class="small" id="clock" style="margin-top:4px">—</div>
   </header>
 
   <div id="safety-warn" class="danger-box" style="display:none">
@@ -61,21 +69,34 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
     Change them in the Configuration section below.
   </div>
 
+  <div id="rain-warn" class="info-box" style="display:none">
+    <strong>Rain forecast:</strong> <span id="rain-detail">—</span> mm expected in the next 3 hours.
+    Auto-watering is paused to avoid overwatering.
+  </div>
+
+  <div id="fault-warn" class="danger-box" style="display:none">
+    <strong>Sensor Fault:</strong> <span id="fault-detail">—</span>
+    Please check sensor wiring and replace if necessary.
+  </div>
+
   <div class="grid">
     <div class="card">
       <h2>Field Sensors</h2>
       <div class="sensor-grid">
         <div class="sensor-box">
+          <span class="fault-badge" id="temp-fault">FAULT</span>
           <div class="sensor-name">Temperature</div>
           <div class="sensor-value" id="temperature">--</div>
           <div class="sensor-unit">°C</div>
         </div>
         <div class="sensor-box">
+          <span class="fault-badge" id="hum-fault">FAULT</span>
           <div class="sensor-name">Humidity</div>
           <div class="sensor-value" id="humidity">--</div>
           <div class="sensor-unit">%</div>
         </div>
         <div class="sensor-box">
+          <span class="fault-badge" id="moist-fault">FAULT</span>
           <div class="sensor-name">Soil Moisture</div>
           <div class="sensor-value" id="moisture">--</div>
           <div class="sensor-unit">%</div>
@@ -98,11 +119,23 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
       <div class="kv"><span>Conditions</span><span id="w-desc">—</span></div>
       <div class="kv"><span>Temperature</span><span id="w-temp">—</span></div>
       <div class="kv"><span>Humidity</span><span id="w-hum">—</span></div>
+      <div class="kv"><span>Rain (next 3h)</span><span class="badge badge-rain" id="w-rain">—</span></div>
       <div class="controls" style="margin-top:10px">
         <button class="btn btn-primary" id="w-refresh">Refresh Weather</button>
       </div>
-      <div class="notice">Auto-updates every 10 minutes. Requires API key (see Configuration).</div>
+      <div class="notice">Current conditions update every 10 min. Forecast every 30 min.</div>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>Trends (last 24 hours)</h2>
+    <div class="chart-container">
+      <canvas id="trends-chart"></canvas>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-primary" id="refresh-chart">Refresh Chart</button>
+    </div>
+    <div class="notice">Data is logged every 60 seconds on the device.</div>
   </div>
 
   <div class="card">
@@ -117,10 +150,34 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
         <input id="humidity-threshold" class="input" type="number" step="1" min="0" max="100" />
       </div>
     </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Watering Window Start Hour (0-23)</label>
+        <input id="water-start-hour" class="input" type="number" step="1" min="0" max="23" />
+      </div>
+      <div>
+        <label>Watering Window End Hour (0-23)</label>
+        <input id="water-end-hour" class="input" type="number" step="1" min="0" max="23" />
+      </div>
+    </div>
+    <div class="notice">If start == end, watering is allowed any time. Set both to 0 to disable scheduling.</div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-settings">Save</button>
     </div>
-    <div class="notice">Thresholds persist in device memory.</div>
+    <div class="notice">Thresholds and schedule persist in device memory.</div>
+  </div>
+
+  <div class="card">
+    <h2>Sensor Calibration</h2>
+    <div class="kv"><span>Current Raw ADC</span><span class="badge" id="calib-raw">—</span></div>
+    <div class="kv"><span>Dry Calibration (raw)</span><span class="badge" id="calib-dry">—</span></div>
+    <div class="kv"><span>Wet Calibration (raw)</span><span class="badge" id="calib-wet">—</span></div>
+    <div class="notice">Place sensor in dry air, click "Set Dry". Place in water, click "Set Wet".</div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-warn" id="calib-dry-btn">Set Dry</button>
+      <button class="btn btn-primary" id="calib-wet-btn">Set Wet</button>
+      <button class="btn btn-success" id="calib-refresh">Refresh</button>
+    </div>
   </div>
 
   <div class="card">
@@ -155,19 +212,18 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-config">Save Configuration</button>
       <button class="btn btn-warn" id="reset-wifi">Reset WiFi Configuration</button>
+      <a class="btn btn-primary" href="/update" target="_blank">OTA Firmware Update</a>
     </div>
     <div class="notice">
       API key and credentials are stored in device memory (NVS).<br>
-      "Reset WiFi Configuration" clears stored WiFi credentials and reboots
-      the device into the captive portal for reconfiguration.
+      OTA updates: upload a compiled .bin file at <code>/update</code>.<br>
+      "Reset WiFi Configuration" clears stored WiFi credentials and reboots into captive portal.
     </div>
   </div>
 
 </div>
 
 <script>
-// P1-6: X-Requested-With header is sent on all POST requests to prevent CSRF.
-// The server rejects any POST without this header.
 const CSRF_HEADER = {'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'};
 
 const temperatureEl = document.getElementById('temperature');
@@ -175,6 +231,7 @@ const humidityEl    = document.getElementById('humidity');
 const moistureEl    = document.getElementById('moisture');
 const systemStatusEl= document.getElementById('system-status');
 const relayStatusEl = document.getElementById('relay-status');
+const clockEl       = document.getElementById('clock');
 
 const waterOnBtn  = document.getElementById('water-on');
 const waterOffBtn = document.getElementById('water-off');
@@ -184,10 +241,15 @@ const wName = document.getElementById('w-name');
 const wDesc = document.getElementById('w-desc');
 const wTemp = document.getElementById('w-temp');
 const wHum  = document.getElementById('w-hum');
+const wRain = document.getElementById('w-rain');
 const wRefresh = document.getElementById('w-refresh');
+const rainWarn = document.getElementById('rain-warn');
+const rainDetail = document.getElementById('rain-detail');
 
 const moistInp = document.getElementById('moisture-threshold');
 const humInp   = document.getElementById('humidity-threshold');
+const waterStartInp = document.getElementById('water-start-hour');
+const waterEndInp   = document.getElementById('water-end-hour');
 const saveBtn  = document.getElementById('save-settings');
 
 const cfgApiKey = document.getElementById('cfg-api-key');
@@ -200,6 +262,21 @@ const resetWifiBtn = document.getElementById('reset-wifi');
 
 const safetyWarn = document.getElementById('safety-warn');
 const defaultCredsWarn = document.getElementById('default-creds-warn');
+const faultWarn = document.getElementById('fault-warn');
+const faultDetail = document.getElementById('fault-detail');
+const tempFaultBadge = document.getElementById('temp-fault');
+const humFaultBadge  = document.getElementById('hum-fault');
+const moistFaultBadge= document.getElementById('moist-fault');
+
+const calibRaw  = document.getElementById('calib-raw');
+const calibDry  = document.getElementById('calib-dry');
+const calibWet  = document.getElementById('calib-wet');
+const calibDryBtn = document.getElementById('calib-dry-btn');
+const calibWetBtn = document.getElementById('calib-wet-btn');
+const calibRefresh = document.getElementById('calib-refresh');
+
+const refreshChartBtn = document.getElementById('refresh-chart');
+let trendsChart = null;
 
 let moistureThreshold = 30;
 let humidityThreshold = 50;
@@ -209,6 +286,7 @@ function updateSensorData(){
     temperatureEl.textContent = (typeof d.temperature==='number') ? d.temperature.toFixed(1) : '--';
     humidityEl.textContent    = (typeof d.humidity==='number')    ? d.humidity.toFixed(1)    : '--';
     moistureEl.textContent    = (typeof d.moisture==='number')    ? d.moisture.toFixed(1)    : '--';
+    calibRaw.textContent = (typeof d.raw_moisture==='number') ? d.raw_moisture : '—';
   }).catch(()=>{});
 }
 
@@ -219,8 +297,15 @@ function updateSystemStatus(){
     relayStatusEl.textContent = `Motor Status: ${d.relay?'ON':'OFF'}`;
     relayStatusEl.className   = `status ${d.relay?'status-on':'status-off'}`;
     updateAutoModeButton(d.status==='Auto');
-    if (d.safety_trip) safetyWarn.style.display = 'block';
-    else safetyWarn.style.display = 'none';
+    safetyWarn.style.display = d.safety_trip ? 'block' : 'none';
+
+    let faults = [];
+    if (d.dht_fault) { tempFaultBadge.classList.add('show'); humFaultBadge.classList.add('show'); faults.push('DHT11'); }
+    else { tempFaultBadge.classList.remove('show'); humFaultBadge.classList.remove('show'); }
+    if (d.moisture_fault) { moistFaultBadge.classList.add('show'); faults.push('Soil Moisture'); }
+    else { moistFaultBadge.classList.remove('show'); }
+    if (faults.length) { faultDetail.textContent = faults.join(', ') + ' sensor(s) not responding.'; faultWarn.style.display = 'block'; }
+    else { faultWarn.style.display = 'none'; }
   }).catch(()=>{});
 }
 
@@ -230,6 +315,14 @@ function fetchWeather(){
     wDesc.textContent = w.desc || '—';
     wTemp.textContent = (typeof w.temp==='number') ? `${w.temp.toFixed(1)} °C` : '—';
     wHum.textContent  = (typeof w.hum==='number')  ? `${w.hum.toFixed(0)} %`   : '—';
+    if (typeof w.rain_3h==='number') {
+      wRain.textContent = `${w.rain_3h.toFixed(1)} mm`;
+      if (w.rain_expected) { rainDetail.textContent = w.rain_3h.toFixed(1); rainWarn.style.display = 'block'; }
+      else { rainWarn.style.display = 'none'; }
+    } else {
+      wRain.textContent = '—';
+      rainWarn.style.display = 'none';
+    }
   }).catch(()=>{});
 }
 
@@ -239,13 +332,17 @@ function loadSettings(){
     humidityThreshold = s.humidity_threshold ?? 50;
     moistInp.value = moistureThreshold;
     humInp.value = humidityThreshold;
+    waterStartInp.value = s.watering_start_hour ?? 6;
+    waterEndInp.value   = s.watering_end_hour ?? 8;
   }).catch(()=>{});
 }
 
 function saveSettings(){
   const body = {
     moisture_threshold: parseFloat(moistInp.value||30),
-    humidity_threshold: parseFloat(humInp.value||50)
+    humidity_threshold: parseFloat(humInp.value||50),
+    watering_start_hour: parseInt(waterStartInp.value||0),
+    watering_end_hour: parseInt(waterEndInp.value||0)
   };
   fetch('/settings',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
     .then(r=>r.json()).then(_=>{ loadSettings(); }).catch(()=>{});
@@ -271,57 +368,94 @@ function loadConfig(){
     cfgCountry.value   = c.country || '';
     cfgAuthUser.value  = c.auth_user || 'admin';
     cfgAuthPass.value  = '';
-    if (c.auth_user === 'admin' && c.using_default_pass) {
-      defaultCredsWarn.style.display = 'block';
-    } else {
-      defaultCredsWarn.style.display = 'none';
-    }
+    if (c.auth_user === 'admin' && c.using_default_pass) defaultCredsWarn.style.display = 'block';
+    else defaultCredsWarn.style.display = 'none';
   }).catch(()=>{});
 }
 
 function saveConfig(){
-  const body = {
-    api_key:    cfgApiKey.value,
-    city:       cfgCity.value,
-    country:    cfgCountry.value.toUpperCase(),
-    auth_user:  cfgAuthUser.value
-  };
+  const body = { api_key: cfgApiKey.value, city: cfgCity.value, country: cfgCountry.value.toUpperCase(), auth_user: cfgAuthUser.value };
   if (cfgAuthPass.value) body.auth_pass = cfgAuthPass.value;
   fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
       if (d.success) {
         alert('Configuration saved. If you changed the API key or city, weather will refresh shortly.');
-        if (d.rebuild_url) {
-          setTimeout(fetchWeather, 1500);
-        }
+        if (d.rebuild_url) setTimeout(fetchWeather, 1500);
         loadConfig();
-      } else {
-        alert('Failed to save: ' + (d.error || 'unknown error'));
-      }
+      } else alert('Failed to save: ' + (d.error || 'unknown error'));
     }).catch(()=>{ alert('Network error saving config'); });
 }
 
 function resetWifi(){
   if (!confirm('This will erase stored WiFi credentials and reboot the device into the captive portal. Continue?')) return;
   fetch('/reset-wifi',{method:'POST',headers:CSRF_HEADER})
-    .then(r=>r.json()).then(d=>{
-      if (d.success) {
-        alert('Rebooting. Connect to the "SmartAgri-Setup" WiFi network to reconfigure.');
-      }
-    }).catch(()=>{});
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('Rebooting. Connect to the "SmartAgri-Setup" WiFi network to reconfigure.'); })
+    .catch(()=>{});
 }
 
 saveCfgBtn.onclick = saveConfig;
 resetWifiBtn.onclick = resetWifi;
 
+function loadCalibration(){
+  fetch('/calibrate').then(r=>r.json()).then(c=>{
+    calibDry.textContent = c.dry ?? '—';
+    calibWet.textContent = c.wet ?? '—';
+  }).catch(()=>{});
+}
+function setCalibration(action){
+  fetch('/calibrate',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify({action})})
+    .then(r=>r.json()).then(d=>{
+      if (d.success) { loadCalibration(); alert(`${action === 'set_dry' ? 'Dry' : 'Wet'} calibration saved: ${d.value}`); }
+      else alert('Calibration failed: ' + (d.error || 'unknown'));
+    }).catch(()=>{ alert('Network error'); });
+}
+calibDryBtn.onclick = ()=>setCalibration('set_dry');
+calibWetBtn.onclick = ()=>setCalibration('set_wet');
+calibRefresh.onclick = ()=>{ updateSensorData(); loadCalibration(); };
+
+function fetchAndRenderChart(){
+  fetch('/history?hours=24').then(r=>r.json()).then(data=>{
+    const labels = data.map(p => p.t);
+    const tempData = data.map(p => p.temp);
+    const humData  = data.map(p => p.hum);
+    const moistData= data.map(p => p.moist);
+    const ctx = document.getElementById('trends-chart').getContext('2d');
+    if (trendsChart) trendsChart.destroy();
+    trendsChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          { label: 'Temperature (°C)', data: tempData,  borderColor: '#e74c3c', backgroundColor: 'rgba(231,76,60,0.1)', tension: 0.3, yAxisID: 'y' },
+          { label: 'Humidity (%)',     data: humData,   borderColor: '#3498db', backgroundColor: 'rgba(52,152,219,0.1)', tension: 0.3, yAxisID: 'y' },
+          { label: 'Soil Moisture (%)',data: moistData, borderColor: '#27ae60', backgroundColor: 'rgba(39,174,96,0.1)', tension: 0.3, yAxisID: 'y' }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: { x: { ticks: { maxTicksLimit: 12 } }, y: { min: 0, max: 100, title: { display: true, text: 'Value' } } },
+        plugins: { legend: { position: 'top' } }
+      }
+    });
+  }).catch(()=>{});
+}
+refreshChartBtn.onclick = fetchAndRenderChart;
+
+function updateClock(){ fetch('/time').then(r=>r.json()).then(d=>{ clockEl.textContent = d.time || '—'; }).catch(()=>{}); }
+
 function init(){
   loadSettings();
   loadConfig();
+  loadCalibration();
   updateSensorData();
   updateSystemStatus();
   fetchWeather();
+  fetchAndRenderChart();
+  updateClock();
   setInterval(()=>{ updateSensorData(); updateSystemStatus(); }, 5000);
   setInterval(()=>{ fetchWeather(); }, 600000);
+  setInterval(()=>{ updateClock(); }, 30000);
+  setInterval(()=>{ fetchAndRenderChart(); }, 300000);
 }
 init();
 </script>
