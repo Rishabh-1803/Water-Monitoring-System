@@ -34,25 +34,31 @@ See [`hardware/pin-connections.md`](hardware/pin-connections.md) for full wiring
 ### Core (P0 + P1)
 - Real-time soil moisture, temperature, and humidity monitoring
 - Auto-irrigation with 5% hysteresis to prevent relay chatter
-- **5-minute max watering safety cutoff** (prevents flooding if sensor fails)
+- 5-minute max watering safety cutoff
 - Manual override (Water ON / OFF / Auto Mode) via web UI
-- Threshold + configuration persistence in NVS (survives reboot)
-- **WiFiManager captive portal** for WiFi setup (no hardcoded credentials)
-- **HTTPS** for OpenWeatherMap API calls
-- **HTTP Basic Auth** on all routes (configurable username/password)
-- **CSRF protection** on all POST endpoints
-- **Automatic WiFi reconnect** if connection drops
-- Live local weather from OpenWeatherMap (10-min refresh)
-- mDNS hostname: `http://project.local/`
+- WiFiManager captive portal (no hardcoded credentials)
+- HTTPS for OpenWeatherMap API calls
+- HTTP Basic Auth on all routes
+- CSRF protection on all POST endpoints
+- Automatic WiFi reconnect
 
 ### Advanced (P2)
-- **OTA firmware updates** — upload new `.bin` files at `/update` (no USB cable needed)
-- **NTP time sync** — device clock stays accurate; powers scheduled watering
-- **Scheduled watering window** — only water during configured hours (e.g., 6 AM to 8 AM)
-- **Sensor fault detection** — DHT11 NaN streak and moisture sensor out-of-range detection, with red fault badges in the UI
-- **Forecast-aware watering** — skips watering if rain ≥ 1 mm is forecast in the next 3 hours (saves water, prevents overwatering)
-- **24-hour trends chart** — Chart.js visualization of temperature, humidity, and soil moisture history (logged every 60 seconds to LittleFS)
-- **Moisture sensor calibration wizard** — set DRY/WET calibration points from the web UI (no reflash needed)
+- OTA firmware updates at `/update`
+- NTP time sync (IST)
+- Scheduled watering window (configurable start/end hour)
+- Sensor fault detection (DHT11 + moisture) with UI badges
+- Forecast-aware watering (skips if rain ≥ 1mm in next 3 hours)
+- 24-hour trends chart (LittleFS + Chart.js)
+- Moisture sensor calibration wizard
+
+### Cloud & Integration (P3)
+- **MQTT integration** — publish sensor data to Home Assistant / Node-RED / any MQTT broker; subscribe to remote commands
+- **Telegram alerts** — push notifications for sensor faults, safety trips, watering events, WiFi/MQTT disconnects, and device boots
+- **TLS certificate validation** — optionally validate OpenWeatherMap and Telegram certs using a user-provided root CA (replaces `setInsecure()`)
+- **Diagnostics dashboard** — uptime, free heap, WiFi RSSI, LittleFS usage, MQTT state, pump stats, last boot time
+- **Pump cycle counter** — tracks total pump activations and cumulative runtime, persisted to NVS
+- **Backup/Restore configuration** — export all settings as JSON, import on another device
+- **CSV data export** — download historical sensor log as CSV from the UI
 
 ## Firmware
 
@@ -69,81 +75,171 @@ Install via Arduino IDE Library Manager (Sketch → Include Library → Manage L
 | AsyncTCP | me-no-dev | Async TCP for ESP32 |
 | DHT sensor library | Adafruit | DHT11 driver |
 | WiFiManager | tzapu | Captive portal for WiFi setup |
-| **AsyncElegantOTA** | Ayush Sharma | **OTA firmware updates** at `/update` |
+| AsyncElegantOTA | Ayush Sharma | OTA firmware updates |
+| **PubSubClient** | Nick O'Leary | **MQTT client** (new in P3) |
 
 The following come bundled with the ESP32 board package (no install needed):
 - `WiFi.h`, `WiFiClientSecure.h`, `HTTPClient.h`, `Preferences.h`, `ESPmDNS.h`, `LittleFS.h`, `time.h`
 
 ### Board Settings (Arduino IDE)
 
-- **Board:** `ESP32S3 Dev Module` (or your specific S3 board variant)
-- **Port:** the COM port that appears when you plug in the S3 via USB
+- **Board:** `ESP32S3 Dev Module`
 - **Upload Speed:** 921600
-- **USB CDC On Boot:** `Enabled` (so `Serial.print` shows up over USB)
+- **USB CDC On Boot:** `Enabled`
 - **USB Mode:** `USB-OTG (TinyUSB)`
 - **Flash Size:** 4MB (or whatever your board has)
-- **Partition Scheme:** `Default 4MB with ffat` (or `FAT 1MB app + 2MB FATFS` if available — LittleFS works on either)
+- **Partition Scheme:** `Default 4MB with ffat` (LittleFS works on either FAT or LittleFS partitions)
 
 ### First Boot Setup
 
 1. Flash the firmware to the ESP32-S3 via USB
-2. On your phone or computer, look for a new WiFi network called **`SmartAgri-Setup`** and connect to it
+2. Connect to the `SmartAgri-Setup` WiFi network from your phone/laptop
 3. A captive portal page should pop up automatically (if not, browse to `http://192.168.4.1`)
-4. Enter your WiFi network name (SSID) and password, then click Save
-5. The ESP32-S3 will reboot and connect to your WiFi
-6. Open the Arduino IDE Serial Monitor at 115200 baud to see the assigned IP address (also visible as `http://project.local/` if your OS supports mDNS)
-7. Open the URL in a browser. Log in with the **default credentials**: username `admin`, password `admin`
-8. Go to the **Configuration** section and enter your OpenWeatherMap API key, city, and country code
-9. **Change the default username/password** in the same section (the UI will warn you if defaults are still in use)
-10. (Optional) Go to **Sensor Calibration**, place the moisture sensor in dry air, click **Set Dry**, then place in water and click **Set Wet**
-11. (Optional) Adjust the **Watering Window** in Settings to limit auto-watering to specific hours
+4. Enter your WiFi credentials and click Save
+5. The device reboots and connects to your WiFi — check Serial Monitor for the IP
+6. Open `http://project.local/` (or the IP) in a browser
+7. Log in with default credentials: `admin` / `admin`
+8. Go to **Configuration** → enter OpenWeatherMap API key, city, country
+9. **Change the default password** (UI shows a warning until you do)
+10. (Optional) Configure MQTT, Telegram, TLS validation as needed
+11. (Optional) Calibrate the moisture sensor in the **Sensor Calibration** card
 
-### Updating Firmware via OTA
+## MQTT Integration (P3-1)
 
-Once the device is on your WiFi and the initial USB flash is done, future updates can be done over the air:
+### Configuration
+In the web UI, go to the **MQTT Integration** card and set:
+- Enable MQTT: `true`
+- Broker Host: e.g. `broker.hivemq.com` (public test broker) or `192.168.1.50` (your Home Assistant IP)
+- Broker Port: `1883` (or `8883` for TLS — note: TLS broker not yet supported, use 1883)
+- Topic Prefix: `smartfarm` (default)
+- Username / Password: optional, if your broker requires auth
 
-1. In Arduino IDE: **Sketch → Export Compiled Binary** (this produces a `.bin` file in the sketch folder)
-2. Open `http://project.local/update` in a browser
-3. Log in with your web UI credentials
-4. Upload the `.bin` file
-5. The device reboots automatically with the new firmware
+### Published Topics
+The device publishes to these topics every 30 seconds (retained = true):
 
-### Changing WiFi Credentials Later
+| Topic | Payload | Example |
+|-------|---------|---------|
+| `<prefix>/sensor/temperature` | float | `25.3` |
+| `<prefix>/sensor/humidity` | float | `60.5` |
+| `<prefix>/sensor/moisture` | float | `45.2` |
+| `<prefix>/sensor/relay` | string | `ON` or `OFF` |
+| `<prefix>/status` | JSON | `{"temperature":25.3,"humidity":60.5,"moisture":45.2,"watering":false,"auto_mode":true,...}` |
 
-1. Open the web UI
-2. Go to the Configuration section
-3. Click **"Reset WiFi Configuration"**
-4. The device will reboot into the captive portal — repeat the First Boot Setup steps above
+### Subscribed Topics
+The device listens on these topics for remote commands:
 
-## Web UI Overview
+| Topic | Action |
+|-------|--------|
+| `<prefix>/cmd/water_on` | Turn pump ON (switches to manual mode) |
+| `<prefix>/cmd/water_off` | Turn pump OFF (switches to manual mode) |
+| `<prefix>/cmd/auto_mode` | Toggle auto mode |
 
-The dashboard includes these cards:
+### Home Assistant Example
+Add this to your `configuration.yaml` to track moisture:
 
-| Card | Purpose |
-|------|---------|
-| Header | Title + live device clock |
-| Field Sensors | Temperature, humidity, soil moisture (with fault badges) + system/motor status + manual controls |
-| Local Weather | Current conditions + rain forecast for next 3 hours |
-| Trends | 24-hour line chart of temp/hum/moisture (Chart.js) |
-| Settings | Moisture/humidity thresholds + watering window hours |
-| Sensor Calibration | View current raw ADC + set dry/wet calibration points |
-| Configuration | API key, city, country, auth credentials, OTA link, WiFi reset |
+```yaml
+mqtt:
+  sensor:
+    - name: "Soil Moisture"
+      state_topic: "smartfarm/sensor/moisture"
+      unit_of_measurement: "%"
+      device_class: moisture
+    - name: "Greenhouse Temperature"
+      state_topic: "smartfarm/sensor/temperature"
+      unit_of_measurement: "°C"
+      device_class: temperature
+```
+
+## Telegram Alerts (P3-2)
+
+### Setup
+1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+2. Send `/newbot` and follow the prompts to create a bot
+3. Copy the bot token (format: `123456789:ABCdefGHIjklMNOpqrSTUvwxYZ`)
+4. Message [@userinfobot](https://t.me/userinfobot) to get your Chat ID (a number like `123456789`)
+5. In the web UI, go to the **Telegram Alerts** card:
+   - Enable Telegram: `true`
+   - Chat ID: your numeric chat ID
+   - Bot Token: the token from step 3
+6. Click **Save Telegram Config**
+7. Click **Send Test Alert** — you should receive a message in Telegram
+
+### Alert Types
+The device sends alerts for:
+- 🚀 Device boot (with IP and timestamp)
+- ⚠️ DHT11 sensor fault detected
+- ✅ DHT11 sensor recovered
+- ⚠️ Moisture sensor fault detected
+- ✅ Moisture sensor recovered
+- 🚨 Safety trip (pump ran > 5 minutes)
+- 💧 Watering started (with sensor values)
+- 🛑 Watering stopped (with duration)
+- 📡 WiFi disconnected > 5 minutes
+- 📡 WiFi reconnected (with new IP)
+- 🔌 MQTT disconnected
+
+Each alert type has a 5-minute cooldown to prevent spam.
+
+## TLS Certificate Validation (P3-3)
+
+By default, the device uses `setInsecure()` for HTTPS calls (encrypted but not authenticated — vulnerable to MITM). To enable proper cert validation:
+
+1. Get the root CA for `api.openweathermap.org`:
+   ```bash
+   openssl s_client -showcerts -connect api.openweathermap.org:443 </dev/null 2>/dev/null \
+     | openssl x509 -outform PEM
+   ```
+2. In the web UI **Configuration** card:
+   - Set **Validate TLS Cert** to `Enabled`
+   - Paste the PEM cert (including `-----BEGIN CERTIFICATE-----` and `-----END CERTIFICATE-----`) into the **Root CA Certificate** field
+3. Click **Save Configuration**
+
+The same cert is used for both OpenWeatherMap and Telegram API calls.
+
+**Note:** If the cert expires or the provider changes their CA chain, HTTPS calls will fail silently. The device will continue operating with cached/stale weather data.
+
+## Backup / Restore (P3-6)
+
+### Backup
+1. Click **Backup Config** in the Configuration card
+2. A JSON file `smartfarm-config-backup.json` downloads automatically
+3. This file contains all settings except WiFi credentials and the web UI password
+
+### Restore
+1. Click **Restore Config**
+2. Select a previously-backed-up JSON file
+3. All settings are imported and the device reboots
+
+Use this to clone config across multiple devices, or to restore after a reflash.
+
+## CSV Export (P3-7)
+
+Click **Download CSV** in the Trends card to download the full sensor log as a CSV file. The file is named `smartfarm_log_YYYYMMDDTHHMMSS.csv` and contains columns: `timestamp,temperature,humidity,moisture,watering`.
+
+## Updating Firmware via OTA
+
+1. In Arduino IDE: **Sketch → Export Compiled Binary**
+2. Open `http://project.local/update`
+3. Upload the `.bin` file
+4. The device reboots automatically with the new firmware
 
 ## Auto-Watering Decision Logic
 
 The auto-mode loop checks **all** of these conditions before turning the pump ON:
 
-1. ✅ Within the configured watering window (e.g., 6 AM – 8 AM)
-2. ✅ No rain ≥ 1 mm forecast in the next 3 hours
+1. ✅ Within the configured watering window
+2. ✅ No rain ≥ 1 mm forecast in next 3 hours
 3. ✅ Moisture sensor is healthy (not in fault state)
-4. ✅ Soil moisture is below the threshold (with 5% hysteresis to prevent chatter)
+4. ✅ Soil moisture is below the threshold (with 5% hysteresis)
+5. ✅ Max watering duration not exceeded
 
-If any condition becomes false while the pump is running, the pump is turned OFF immediately. Additionally, a hard 5-minute cutoff trips if the pump runs continuously (sensor failure protection).
+If any condition becomes false mid-watering, the pump turns OFF immediately and a Telegram alert is sent.
 
 ## Security Notes
 
-- **No hardcoded secrets in source.** WiFi credentials, API key, and web UI credentials are all stored in NVS and configured at runtime.
-- **HTTPS** is used for OpenWeatherMap API calls. Certificate validation is currently skipped (`setInsecure()`) to keep the firmware simple. For a production deployment, bundle the OpenWeatherMap root CA certificate using `WiFiClientSecure::setCACert()`.
-- **HTTP Basic Auth** protects all routes. Credentials travel in plaintext over HTTP — for a production deployment, also enable HTTPS on the local web server (the ESP32-S3 has the resources for TLS).
-- **Default credentials are `admin`/`admin`**. The web UI displays a yellow warning banner until you change them.
-- **CSRF protection** requires the `X-Requested-With: XMLHttpRequest` header on all POSTs, blocking cross-origin attacks from malicious websites.
+- **No hardcoded secrets in source.** All credentials (WiFi, API key, MQTT, Telegram, web UI) are in NVS and configurable at runtime.
+- **HTTPS** for OpenWeatherMap and Telegram API calls. Cert validation is optional (off by default; can be enabled with a user-provided root CA).
+- **HTTP Basic Auth** protects all routes. For production, also enable HTTPS on the local web server.
+- **CSRF protection** on all POST endpoints.
+- **Default credentials are `admin`/`admin`** — the UI warns until you change them.
+- **Backup files contain plaintext secrets** (API key, MQTT password, Telegram bot token). Store them securely.

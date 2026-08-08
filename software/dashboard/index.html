@@ -30,7 +30,7 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 .status-on{background:#d5f5e3;color:#27ae60}
 .status-off{background:#fadbd8;color:#c0392b}
 .controls{display:flex;gap:10px;flex-wrap:wrap}
-.btn{padding:10px 16px;border:none;border-radius:8px;cursor:pointer;font-weight:700;transition:transform .1s ease,opacity .1s ease}
+.btn{padding:10px 16px;border:none;border-radius:8px;cursor:pointer;font-weight:700;transition:transform .1s ease,opacity .1s ease;text-decoration:none;display:inline-block}
 .btn:active{transform:scale(.98)}
 .btn-primary{background:var(--secondary);color:#fff}
 .btn-danger{background:var(--accent);color:#fff}
@@ -38,16 +38,19 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 .btn-warn{background:var(--warn);color:#fff}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .input{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px}
+textarea.input{font-family:monospace;font-size:11px}
 .notice{font-size:12px;opacity:.7}
 .kv{display:flex;justify-content:space-between;margin:6px 0}
 .badge{display:inline-block;background:#eef;border-radius:999px;padding:6px 10px;font-weight:700}
 .badge-rain{background:#aed6f1;color:#1b4f72}
 .badge-ok{background:#d5f5e3;color:#1e8449}
+.badge-bad{background:#fadbd8;color:#c0392b}
 .small{font-size:12px}
 .warn-box{background:#fff3cd;border:1px solid #ffe69c;color:#664d03;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 .danger-box{background:#f8d7da;border:1px solid #f1aeb5;color:#58151c;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 .info-box{background:#d1ecf1;border:1px solid #bee5eb;color:#0c5460;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 .chart-container{position:relative;height:300px}
+.muted{opacity:.6;font-size:11px}
 </style>
 </head>
 <body>
@@ -55,7 +58,7 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 
   <header>
     <h1>Smart Agricultural System</h1>
-    <div class="small">ESP32-S3 • DHT11 + Soil Moisture + Relay • Live Weather + Trends + OTA</div>
+    <div class="small">ESP32-S3 • DHT11 + Soil Moisture + Relay • Weather + Trends + MQTT + Alerts + OTA</div>
     <div class="small" id="clock" style="margin-top:4px">—</div>
   </header>
 
@@ -123,7 +126,7 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
       <div class="controls" style="margin-top:10px">
         <button class="btn btn-primary" id="w-refresh">Refresh Weather</button>
       </div>
-      <div class="notice">Current conditions update every 10 min. Forecast every 30 min.</div>
+      <div class="notice">Current conditions every 10 min. Forecast every 30 min.</div>
     </div>
   </div>
 
@@ -134,8 +137,27 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
     </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-primary" id="refresh-chart">Refresh Chart</button>
+      <a class="btn btn-success" href="/export.csv" target="_blank">Download CSV</a>
     </div>
     <div class="notice">Data is logged every 60 seconds on the device.</div>
+  </div>
+
+  <div class="card">
+    <h2>Diagnostics</h2>
+    <div class="kv"><span>Uptime</span><span id="diag-uptime">—</span></div>
+    <div class="kv"><span>Free Heap</span><span id="diag-heap">—</span></div>
+    <div class="kv"><span>WiFi RSSI</span><span id="diag-rssi">—</span></div>
+    <div class="kv"><span>WiFi SSID</span><span id="diag-ssid">—</span></div>
+    <div class="kv"><span>IP Address</span><span id="diag-ip">—</span></div>
+    <div class="kv"><span>LittleFS Used</span><span id="diag-fs">—</span></div>
+    <div class="kv"><span>MQTT Status</span><span id="diag-mqtt">—</span></div>
+    <div class="kv"><span>Pump Cycles</span><span id="diag-cycles">—</span></div>
+    <div class="kv"><span>Pump Total Runtime</span><span id="diag-runtime">—</span></div>
+    <div class="kv"><span>Last Boot</span><span id="diag-boot">—</span></div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-primary" id="diag-refresh">Refresh</button>
+      <button class="btn btn-warn" id="diag-reboot">Reboot Device</button>
+    </div>
   </div>
 
   <div class="card">
@@ -160,11 +182,10 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
         <input id="water-end-hour" class="input" type="number" step="1" min="0" max="23" />
       </div>
     </div>
-    <div class="notice">If start == end, watering is allowed any time. Set both to 0 to disable scheduling.</div>
+    <div class="notice">If start == end, watering is allowed any time.</div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-settings">Save</button>
     </div>
-    <div class="notice">Thresholds and schedule persist in device memory.</div>
   </div>
 
   <div class="card">
@@ -207,17 +228,98 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
         <label>New Web UI Password (leave blank to keep current)</label>
         <input id="cfg-auth-pass" class="input" type="password" placeholder="••••••" />
       </div>
-      <div></div>
+      <div>
+        <label>Validate TLS Cert (advanced)</label>
+        <select id="cfg-tls-validate" class="input">
+          <option value="false">Disabled (insecure, default)</option>
+          <option value="true">Enabled (paste root CA below)</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <label>Root CA Certificate (PEM format, optional)</label>
+      <textarea id="cfg-root-ca" class="input" rows="4" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+      <div class="notice">Get the cert with: <code>openssl s_client -showcerts -connect api.openweathermap.org:443 &lt;/dev/null 2&gt;/dev/null | openssl x509 -outform PEM</code></div>
     </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-config">Save Configuration</button>
-      <button class="btn btn-warn" id="reset-wifi">Reset WiFi Configuration</button>
-      <a class="btn btn-primary" href="/update" target="_blank">OTA Firmware Update</a>
+      <button class="btn btn-warn" id="reset-wifi">Reset WiFi</button>
+      <a class="btn btn-primary" href="/update" target="_blank">OTA Update</a>
+      <button class="btn btn-primary" id="backup-config">Backup Config</button>
+      <button class="btn btn-warn" id="restore-config">Restore Config</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>MQTT Integration</h2>
+    <div class="form-row">
+      <div>
+        <label>Enable MQTT</label>
+        <select id="cfg-mqtt-enabled" class="input">
+          <option value="false">Disabled</option>
+          <option value="true">Enabled</option>
+        </select>
+      </div>
+      <div>
+        <label>Broker Host</label>
+        <input id="cfg-mqtt-broker" class="input" type="text" placeholder="broker.hivemq.com or 192.168.1.50" />
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Broker Port</label>
+        <input id="cfg-mqtt-port" class="input" type="number" placeholder="1883" />
+      </div>
+      <div>
+        <label>Topic Prefix</label>
+        <input id="cfg-mqtt-prefix" class="input" type="text" placeholder="smartfarm" />
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Username (optional)</label>
+        <input id="cfg-mqtt-user" class="input" type="text" />
+      </div>
+      <div>
+        <label>Password (optional)</label>
+        <input id="cfg-mqtt-pass" class="input" type="password" />
+      </div>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-success" id="save-mqtt">Save MQTT Config</button>
     </div>
     <div class="notice">
-      API key and credentials are stored in device memory (NVS).<br>
-      OTA updates: upload a compiled .bin file at <code>/update</code>.<br>
-      "Reset WiFi Configuration" clears stored WiFi credentials and reboots into captive portal.
+      Publishes: <code>&lt;prefix&gt;/sensor/{temperature,humidity,moisture,relay}</code> every 30s, <code>&lt;prefix&gt;/status</code> on change.<br>
+      Subscribes: <code>&lt;prefix&gt;/cmd/{water_on,water_off,auto_mode}</code>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Telegram Alerts</h2>
+    <div class="form-row">
+      <div>
+        <label>Enable Telegram</label>
+        <select id="cfg-tg-enabled" class="input">
+          <option value="false">Disabled</option>
+          <option value="true">Enabled</option>
+        </select>
+      </div>
+      <div>
+        <label>Chat ID</label>
+        <input id="cfg-tg-chat" class="input" type="text" placeholder="e.g. 123456789" />
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <label>Bot Token</label>
+      <input id="cfg-tg-token" class="input" type="text" placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ" />
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-success" id="save-telegram">Save Telegram Config</button>
+      <button class="btn btn-primary" id="test-telegram">Send Test Alert</button>
+    </div>
+    <div class="notice">
+      Create a bot via <a href="https://t.me/BotFather" target="_blank">@BotFather</a> to get a token.
+      Message <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a> to get your Chat ID.
     </div>
   </div>
 
@@ -226,66 +328,37 @@ header{background:linear-gradient(120deg,#89f7fe,#66a6ff);color:#073b4c;padding:
 <script>
 const CSRF_HEADER = {'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'};
 
-const temperatureEl = document.getElementById('temperature');
-const humidityEl    = document.getElementById('humidity');
-const moistureEl    = document.getElementById('moisture');
-const systemStatusEl= document.getElementById('system-status');
-const relayStatusEl = document.getElementById('relay-status');
-const clockEl       = document.getElementById('clock');
+const $ = id => document.getElementById(id);
 
-const waterOnBtn  = document.getElementById('water-on');
-const waterOffBtn = document.getElementById('water-off');
-const autoModeBtn = document.getElementById('auto-mode');
-
-const wName = document.getElementById('w-name');
-const wDesc = document.getElementById('w-desc');
-const wTemp = document.getElementById('w-temp');
-const wHum  = document.getElementById('w-hum');
-const wRain = document.getElementById('w-rain');
-const wRefresh = document.getElementById('w-refresh');
-const rainWarn = document.getElementById('rain-warn');
-const rainDetail = document.getElementById('rain-detail');
-
-const moistInp = document.getElementById('moisture-threshold');
-const humInp   = document.getElementById('humidity-threshold');
-const waterStartInp = document.getElementById('water-start-hour');
-const waterEndInp   = document.getElementById('water-end-hour');
-const saveBtn  = document.getElementById('save-settings');
-
-const cfgApiKey = document.getElementById('cfg-api-key');
-const cfgCity   = document.getElementById('cfg-city');
-const cfgCountry= document.getElementById('cfg-country');
-const cfgAuthUser = document.getElementById('cfg-auth-user');
-const cfgAuthPass = document.getElementById('cfg-auth-pass');
-const saveCfgBtn = document.getElementById('save-config');
-const resetWifiBtn = document.getElementById('reset-wifi');
-
-const safetyWarn = document.getElementById('safety-warn');
-const defaultCredsWarn = document.getElementById('default-creds-warn');
-const faultWarn = document.getElementById('fault-warn');
-const faultDetail = document.getElementById('fault-detail');
-const tempFaultBadge = document.getElementById('temp-fault');
-const humFaultBadge  = document.getElementById('hum-fault');
-const moistFaultBadge= document.getElementById('moist-fault');
-
-const calibRaw  = document.getElementById('calib-raw');
-const calibDry  = document.getElementById('calib-dry');
-const calibWet  = document.getElementById('calib-wet');
-const calibDryBtn = document.getElementById('calib-dry-btn');
-const calibWetBtn = document.getElementById('calib-wet-btn');
-const calibRefresh = document.getElementById('calib-refresh');
-
-const refreshChartBtn = document.getElementById('refresh-chart');
+const temperatureEl = $('temperature'), humidityEl = $('humidity'), moistureEl = $('moisture');
+const systemStatusEl = $('system-status'), relayStatusEl = $('relay-status'), clockEl = $('clock');
+const waterOnBtn = $('water-on'), waterOffBtn = $('water-off'), autoModeBtn = $('auto-mode');
+const wName = $('w-name'), wDesc = $('w-desc'), wTemp = $('w-temp'), wHum = $('w-hum'), wRain = $('w-rain'), wRefresh = $('w-refresh');
+const rainWarn = $('rain-warn'), rainDetail = $('rain-detail');
+const moistInp = $('moisture-threshold'), humInp = $('humidity-threshold');
+const waterStartInp = $('water-start-hour'), waterEndInp = $('water-end-hour');
+const saveBtn = $('save-settings');
+const cfgApiKey = $('cfg-api-key'), cfgCity = $('cfg-city'), cfgCountry = $('cfg-country');
+const cfgAuthUser = $('cfg-auth-user'), cfgAuthPass = $('cfg-auth-pass');
+const cfgTlsValidate = $('cfg-tls-validate'), cfgRootCa = $('cfg-root-ca');
+const saveCfgBtn = $('save-config'), resetWifiBtn = $('reset-wifi');
+const backupBtn = $('backup-config'), restoreBtn = $('restore-config');
+const safetyWarn = $('safety-warn'), defaultCredsWarn = $('default-creds-warn');
+const faultWarn = $('fault-warn'), faultDetail = $('fault-detail');
+const tempFaultBadge = $('temp-fault'), humFaultBadge = $('hum-fault'), moistFaultBadge = $('moist-fault');
+const calibRaw = $('calib-raw'), calibDry = $('calib-dry'), calibWet = $('calib-wet');
+const calibDryBtn = $('calib-dry-btn'), calibWetBtn = $('calib-wet-btn'), calibRefresh = $('calib-refresh');
+const refreshChartBtn = $('refresh-chart');
+const diagRefresh = $('diag-refresh'), diagReboot = $('diag-reboot');
+const saveMqttBtn = $('save-mqtt'), saveTelegramBtn = $('save-telegram'), testTelegramBtn = $('test-telegram');
 let trendsChart = null;
-
-let moistureThreshold = 30;
-let humidityThreshold = 50;
+let moistureThreshold = 30, humidityThreshold = 50;
 
 function updateSensorData(){
   fetch('/sensor-data').then(r=>r.json()).then(d=>{
     temperatureEl.textContent = (typeof d.temperature==='number') ? d.temperature.toFixed(1) : '--';
-    humidityEl.textContent    = (typeof d.humidity==='number')    ? d.humidity.toFixed(1)    : '--';
-    moistureEl.textContent    = (typeof d.moisture==='number')    ? d.moisture.toFixed(1)    : '--';
+    humidityEl.textContent = (typeof d.humidity==='number') ? d.humidity.toFixed(1) : '--';
+    moistureEl.textContent = (typeof d.moisture==='number') ? d.moisture.toFixed(1) : '--';
     calibRaw.textContent = (typeof d.raw_moisture==='number') ? d.raw_moisture : '—';
   }).catch(()=>{});
 }
@@ -295,10 +368,9 @@ function updateSystemStatus(){
     systemStatusEl.textContent = `System Status: ${d.status}`;
     systemStatusEl.className = `status ${d.status==='Auto'?'status-auto':'status-manual'}`;
     relayStatusEl.textContent = `Motor Status: ${d.relay?'ON':'OFF'}`;
-    relayStatusEl.className   = `status ${d.relay?'status-on':'status-off'}`;
+    relayStatusEl.className = `status ${d.relay?'status-on':'status-off'}`;
     updateAutoModeButton(d.status==='Auto');
     safetyWarn.style.display = d.safety_trip ? 'block' : 'none';
-
     let faults = [];
     if (d.dht_fault) { tempFaultBadge.classList.add('show'); humFaultBadge.classList.add('show'); faults.push('DHT11'); }
     else { tempFaultBadge.classList.remove('show'); humFaultBadge.classList.remove('show'); }
@@ -314,15 +386,12 @@ function fetchWeather(){
     wName.textContent = w.name || '—';
     wDesc.textContent = w.desc || '—';
     wTemp.textContent = (typeof w.temp==='number') ? `${w.temp.toFixed(1)} °C` : '—';
-    wHum.textContent  = (typeof w.hum==='number')  ? `${w.hum.toFixed(0)} %`   : '—';
+    wHum.textContent = (typeof w.hum==='number') ? `${w.hum.toFixed(0)} %` : '—';
     if (typeof w.rain_3h==='number') {
       wRain.textContent = `${w.rain_3h.toFixed(1)} mm`;
       if (w.rain_expected) { rainDetail.textContent = w.rain_3h.toFixed(1); rainWarn.style.display = 'block'; }
-      else { rainWarn.style.display = 'none'; }
-    } else {
-      wRain.textContent = '—';
-      rainWarn.style.display = 'none';
-    }
+      else rainWarn.style.display = 'none';
+    } else { wRain.textContent = '—'; rainWarn.style.display = 'none'; }
   }).catch(()=>{});
 }
 
@@ -333,7 +402,7 @@ function loadSettings(){
     moistInp.value = moistureThreshold;
     humInp.value = humidityThreshold;
     waterStartInp.value = s.watering_start_hour ?? 6;
-    waterEndInp.value   = s.watering_end_hour ?? 8;
+    waterEndInp.value = s.watering_end_hour ?? 8;
   }).catch(()=>{});
 }
 
@@ -345,12 +414,12 @@ function saveSettings(){
     watering_end_hour: parseInt(waterEndInp.value||0)
   };
   fetch('/settings',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
-    .then(r=>r.json()).then(_=>{ loadSettings(); }).catch(()=>{});
+    .then(r=>r.json()).then(_=>loadSettings()).catch(()=>{});
 }
 
 function sendCommand(command){
   fetch('/control',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify({command})})
-    .then(r=>r.json()).then(_=>{ updateSystemStatus(); }).catch(()=>{});
+    .then(r=>r.json()).then(_=>updateSystemStatus()).catch(()=>{});
 }
 
 function updateAutoModeButton(autoOn){ autoModeBtn.textContent = autoOn ? 'Auto Mode: ON' : 'Auto Mode: OFF'; }
@@ -363,39 +432,134 @@ saveBtn.onclick    = ()=>saveSettings();
 
 function loadConfig(){
   fetch('/config').then(r=>r.json()).then(c=>{
-    cfgApiKey.value    = c.api_key || '';
-    cfgCity.value      = c.city || '';
-    cfgCountry.value   = c.country || '';
-    cfgAuthUser.value  = c.auth_user || 'admin';
-    cfgAuthPass.value  = '';
+    cfgApiKey.value = c.api_key || '';
+    cfgCity.value = c.city || '';
+    cfgCountry.value = c.country || '';
+    cfgAuthUser.value = c.auth_user || 'admin';
+    cfgAuthPass.value = '';
+    cfgTlsValidate.value = c.validate_tls_cert ? 'true' : 'false';
+    cfgRootCa.value = c.root_ca || '';
     if (c.auth_user === 'admin' && c.using_default_pass) defaultCredsWarn.style.display = 'block';
     else defaultCredsWarn.style.display = 'none';
+
+    // MQTT
+    $('cfg-mqtt-enabled').value = c.mqtt_enabled ? 'true' : 'false';
+    $('cfg-mqtt-broker').value = c.mqtt_broker || '';
+    $('cfg-mqtt-port').value = c.mqtt_port || 1883;
+    $('cfg-mqtt-prefix').value = c.mqtt_prefix || 'smartfarm';
+    $('cfg-mqtt-user').value = c.mqtt_user || '';
+    $('cfg-mqtt-pass').value = '';
+
+    // Telegram
+    $('cfg-tg-enabled').value = c.telegram_enabled ? 'true' : 'false';
+    $('cfg-tg-chat').value = c.telegram_chat_id || '';
+    $('cfg-tg-token').value = c.telegram_bot_token || '';
   }).catch(()=>{});
 }
 
 function saveConfig(){
-  const body = { api_key: cfgApiKey.value, city: cfgCity.value, country: cfgCountry.value.toUpperCase(), auth_user: cfgAuthUser.value };
+  const body = {
+    api_key: cfgApiKey.value,
+    city: cfgCity.value,
+    country: cfgCountry.value.toUpperCase(),
+    auth_user: cfgAuthUser.value,
+    validate_tls_cert: cfgTlsValidate.value === 'true',
+    root_ca: cfgRootCa.value
+  };
   if (cfgAuthPass.value) body.auth_pass = cfgAuthPass.value;
   fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
       if (d.success) {
-        alert('Configuration saved. If you changed the API key or city, weather will refresh shortly.');
+        alert('Configuration saved.');
         if (d.rebuild_url) setTimeout(fetchWeather, 1500);
         loadConfig();
-      } else alert('Failed to save: ' + (d.error || 'unknown error'));
-    }).catch(()=>{ alert('Network error saving config'); });
+      } else alert('Failed: ' + (d.error || 'unknown'));
+    }).catch(()=>{ alert('Network error'); });
 }
 
 function resetWifi(){
-  if (!confirm('This will erase stored WiFi credentials and reboot the device into the captive portal. Continue?')) return;
+  if (!confirm('Erase WiFi credentials and reboot into captive portal?')) return;
   fetch('/reset-wifi',{method:'POST',headers:CSRF_HEADER})
-    .then(r=>r.json()).then(d=>{ if (d.success) alert('Rebooting. Connect to the "SmartAgri-Setup" WiFi network to reconfigure.'); })
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('Rebooting. Connect to "SmartAgri-Setup" WiFi.'); })
     .catch(()=>{});
 }
 
 saveCfgBtn.onclick = saveConfig;
 resetWifiBtn.onclick = resetWifi;
 
+// Backup / Restore
+backupBtn.onclick = ()=>{
+  fetch('/backup').then(r=>r.json()).then(data=>{
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'smartfarm-config-backup.json';
+    a.click(); URL.revokeObjectURL(url);
+  }).catch(()=>{ alert('Backup failed'); });
+};
+
+restoreBtn.onclick = ()=>{
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = '.json,application/json';
+  input.onchange = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        fetch('/restore',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(data)})
+          .then(r=>r.json()).then(d=>{
+            if (d.success) alert('Config restored. Device will reboot.');
+            else alert('Restore failed: ' + (d.error || 'unknown'));
+          }).catch(()=>{ alert('Network error'); });
+      } catch(err) { alert('Invalid JSON file: ' + err.message); }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+};
+
+// MQTT
+saveMqttBtn.onclick = ()=>{
+  const body = {
+    mqtt_enabled: $('cfg-mqtt-enabled').value === 'true',
+    mqtt_broker: $('cfg-mqtt-broker').value,
+    mqtt_port: parseInt($('cfg-mqtt-port').value || 1883),
+    mqtt_prefix: $('cfg-mqtt-prefix').value || 'smartfarm',
+    mqtt_user: $('cfg-mqtt-user').value
+  };
+  if ($('cfg-mqtt-pass').value) body.mqtt_pass = $('cfg-mqtt-pass').value;
+  fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if (d.success) alert('MQTT config saved.');
+      else alert('Failed: ' + (d.error || 'unknown'));
+    }).catch(()=>{ alert('Network error'); });
+};
+
+// Telegram
+saveTelegramBtn.onclick = ()=>{
+  const body = {
+    telegram_enabled: $('cfg-tg-enabled').value === 'true',
+    telegram_chat_id: $('cfg-tg-chat').value,
+    telegram_bot_token: $('cfg-tg-token').value
+  };
+  fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if (d.success) alert('Telegram config saved.');
+      else alert('Failed: ' + (d.error || 'unknown'));
+    }).catch(()=>{ alert('Network error'); });
+};
+
+testTelegramBtn.onclick = ()=>{
+  fetch('/telegram/test',{method:'POST',headers:CSRF_HEADER})
+    .then(r=>r.json()).then(d=>{
+      if (d.success) alert('Test alert sent. Check your Telegram.');
+      else alert('Failed: ' + (d.error || 'unknown'));
+    }).catch(()=>{ alert('Network error'); });
+};
+
+// Calibration
 function loadCalibration(){
   fetch('/calibrate').then(r=>r.json()).then(c=>{
     calibDry.textContent = c.dry ?? '—';
@@ -405,57 +569,69 @@ function loadCalibration(){
 function setCalibration(action){
   fetch('/calibrate',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify({action})})
     .then(r=>r.json()).then(d=>{
-      if (d.success) { loadCalibration(); alert(`${action === 'set_dry' ? 'Dry' : 'Wet'} calibration saved: ${d.value}`); }
-      else alert('Calibration failed: ' + (d.error || 'unknown'));
+      if (d.success) { loadCalibration(); alert(`${action === 'set_dry' ? 'Dry' : 'Wet'} set: ${d.value}`); }
+      else alert('Failed: ' + (d.error || 'unknown'));
     }).catch(()=>{ alert('Network error'); });
 }
 calibDryBtn.onclick = ()=>setCalibration('set_dry');
 calibWetBtn.onclick = ()=>setCalibration('set_wet');
 calibRefresh.onclick = ()=>{ updateSensorData(); loadCalibration(); };
 
+// Chart
 function fetchAndRenderChart(){
   fetch('/history?hours=24').then(r=>r.json()).then(data=>{
     const labels = data.map(p => p.t);
-    const tempData = data.map(p => p.temp);
-    const humData  = data.map(p => p.hum);
-    const moistData= data.map(p => p.moist);
-    const ctx = document.getElementById('trends-chart').getContext('2d');
+    const ctx = $('trends-chart').getContext('2d');
     if (trendsChart) trendsChart.destroy();
     trendsChart = new Chart(ctx, {
       type: 'line',
       data: {
         labels: labels,
         datasets: [
-          { label: 'Temperature (°C)', data: tempData,  borderColor: '#e74c3c', backgroundColor: 'rgba(231,76,60,0.1)', tension: 0.3, yAxisID: 'y' },
-          { label: 'Humidity (%)',     data: humData,   borderColor: '#3498db', backgroundColor: 'rgba(52,152,219,0.1)', tension: 0.3, yAxisID: 'y' },
-          { label: 'Soil Moisture (%)',data: moistData, borderColor: '#27ae60', backgroundColor: 'rgba(39,174,96,0.1)', tension: 0.3, yAxisID: 'y' }
+          { label: 'Temperature (°C)', data: data.map(p=>p.temp),  borderColor: '#e74c3c', backgroundColor: 'rgba(231,76,60,0.1)', tension: 0.3 },
+          { label: 'Humidity (%)',     data: data.map(p=>p.hum),   borderColor: '#3498db', backgroundColor: 'rgba(52,152,219,0.1)', tension: 0.3 },
+          { label: 'Soil Moisture (%)',data: data.map(p=>p.moist), borderColor: '#27ae60', backgroundColor: 'rgba(39,174,96,0.1)', tension: 0.3 }
         ]
       },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        scales: { x: { ticks: { maxTicksLimit: 12 } }, y: { min: 0, max: 100, title: { display: true, text: 'Value' } } },
-        plugins: { legend: { position: 'top' } }
-      }
+      options: { responsive: true, maintainAspectRatio: false, scales: { y: { min: 0, max: 100 } }, plugins: { legend: { position: 'top' } } }
     });
   }).catch(()=>{});
 }
 refreshChartBtn.onclick = fetchAndRenderChart;
 
+// Diagnostics
+function updateDiagnostics(){
+  fetch('/diagnostics').then(r=>r.json()).then(d=>{
+    $('diag-uptime').textContent = d.uptime || '—';
+    $('diag-heap').textContent = d.free_heap ? `${(d.free_heap/1024).toFixed(1)} KB` : '—';
+    $('diag-rssi').textContent = (typeof d.rssi === 'number') ? `${d.rssi} dBm` : '—';
+    $('diag-ssid').textContent = d.ssid || '—';
+    $('diag-ip').textContent = d.ip || '—';
+    $('diag-fs').textContent = d.fs_used ? `${(d.fs_used/1024).toFixed(0)} / ${(d.fs_total/1024).toFixed(0)} KB` : '—';
+    $('diag-mqtt').textContent = d.mqtt_enabled ? (d.mqtt_connected ? 'Connected' : 'Disconnected') : 'Disabled';
+    $('diag-cycles').textContent = d.pump_cycles ?? '—';
+    $('diag-runtime').textContent = d.pump_runtime_sec ? `${Math.floor(d.pump_runtime_sec/60)} min ${d.pump_runtime_sec%60} s` : '—';
+    $('diag-boot').textContent = d.last_boot || '—';
+  }).catch(()=>{});
+}
+diagRefresh.onclick = updateDiagnostics;
+diagReboot.onclick = ()=>{
+  if (!confirm('Reboot the device now?')) return;
+  fetch('/reboot',{method:'POST',headers:CSRF_HEADER}).then(r=>r.json()).then(d=>{
+    if (d.success) { alert('Rebooting...'); setTimeout(updateDiagnostics, 10000); }
+  }).catch(()=>{});
+};
+
 function updateClock(){ fetch('/time').then(r=>r.json()).then(d=>{ clockEl.textContent = d.time || '—'; }).catch(()=>{}); }
 
 function init(){
-  loadSettings();
-  loadConfig();
-  loadCalibration();
-  updateSensorData();
-  updateSystemStatus();
-  fetchWeather();
-  fetchAndRenderChart();
-  updateClock();
+  loadSettings(); loadConfig(); loadCalibration();
+  updateSensorData(); updateSystemStatus(); fetchWeather();
+  fetchAndRenderChart(); updateClock(); updateDiagnostics();
   setInterval(()=>{ updateSensorData(); updateSystemStatus(); }, 5000);
   setInterval(()=>{ fetchWeather(); }, 600000);
   setInterval(()=>{ updateClock(); }, 30000);
-  setInterval(()=>{ fetchAndRenderChart(); }, 300000);
+  setInterval(()=>{ fetchAndRenderChart(); updateDiagnostics(); }, 300000);
 }
 init();
 </script>
