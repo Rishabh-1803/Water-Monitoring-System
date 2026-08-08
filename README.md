@@ -1,6 +1,6 @@
 # Water-Monitoring-System
 
-ESP32-S3 based IoT water monitoring system for monitoring or measuring water parameters in real time. The system integrates sensors, embedded programs, and wireless connectivity for collection, processing, and visualization of water data, with applications in smart agriculture, water management, and environmental monitoring.It has a future scope of developing into a smart agriculture IOT system with seamless realtime operations of the farm ,monitored and controlled from all over the world.
+ESP32-S3 based IoT water monitoring system for monitoring or measuring water parameters in real time. The system integrates sensors, embedded programs, and wireless connectivity for collection, processing, and visualization of water data, with applications in smart agriculture, water management, and environmental monitoring.
 
 ## Project Structure
 
