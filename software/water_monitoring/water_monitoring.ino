@@ -3,28 +3,9 @@
 // Water Monitoring + Auto Irrigation + Weather + Trends + Cloud + Hardening
 // -----------------------------------------------------------------------------
 // This build serves the local web UI over plain HTTP only (port 80).
-// The experimental local-HTTPS server (self-signed cert on port 443) has been
-// removed - it never worked correctly (the cert/key were placeholders and the
-// SSL API calls used on AsyncWebServer do not exist), so it has been dropped
-// in favor of a clean, working HTTP-only server.
-//
 // Outbound calls to cloud services (OpenWeatherMap, Telegram, InfluxDB) still
-// use HTTPS via WiFiClientSecure, since those providers require it. That is
-// unrelated to - and unaffected by - removing the local HTTPS server.
-//
-// FEATURES:
-//   - Soil moisture + DHT11 temperature/humidity monitoring with fault detection
-//   - Auto irrigation with scheduled watering window + rain-forecast pause
-//   - OpenWeatherMap current conditions + 3h rain forecast
-//   - 24h trend chart + CSV export, logged to LittleFS
-//   - MQTT publish/subscribe integration
-//   - Telegram alerts
-//   - InfluxDB v2 cloud push
-//   - Access log to LittleFS + /logs endpoint
-//   - Scheduled weekly reboot
-//   - Status LED (GPIO 2) indicating WiFi/MQTT/fault state
-//   - Factory reset endpoint (wipes NVS + LittleFS, reboots to captive portal)
-//   - Rate limiting on auth failures (anti-brute-force)
+// use HTTPS via WiFiClientSecure.
+// OTA Updates are handled via the core ESP32 Update.h library to save RAM.
 // =============================================================================
 
 // ====== Includes ======
@@ -40,7 +21,6 @@
 #include <LittleFS.h>
 #include <time.h>
 #include <PubSubClient.h>
-// #include <ElegantOTA.h>
 #include <Update.h>
 
 // ====== Hardware Pins (ESP32-S3) ======
@@ -48,16 +28,16 @@
 #define DHTTYPE DHT11
 #define MOISTURE_PIN 1
 #define RELAY_PIN 8
-#define STATUS_LED_PIN 2              // Status LED (built-in LED on most S3 boards)
+#define STATUS_LED_PIN 2
 
 // ====== Objects ======
 DHT dht(DHTPIN, DHTTYPE);
 Preferences preferences;
-WebServer server(80);            // HTTP only
+WebServer server(80);
 WiFiClient mqttWifiClient;
 PubSubClient mqtt(mqttWifiClient);
 
-// ====== Device Configuration (loaded from NVS at boot) =====================
+// ====== Device Configuration =====================
 String apiKey       = "";
 String city         = "Ahmedabad";
 String countryCode  = "IN";
@@ -146,7 +126,7 @@ enum AlertType {
   ALERT_MQTT_DISCONNECT, ALERT_BOOT, ALERT_COUNT
 };
 
-// ====== TLS Cert Validation (for OUTBOUND HTTPS calls to cloud APIs) ======
+// ====== TLS Cert Validation ======
 bool   validateTlsCert = false;
 String rootCaPem = "";
 
@@ -188,7 +168,6 @@ int getLocalHour() {
 }
 
 int getLocalWeekday() {
-  // Returns 0=Sunday, 1=Monday, ..., 6=Saturday
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 5000)) return -1;
   return timeinfo.tm_wday;
@@ -204,27 +183,26 @@ String getIsoTimestamp() {
 
 // ====== InfluxDB Config ======
 bool   influxEnabled = false;
-String influxUrl = "";           // e.g. https://eu-central-1-1.aws.cloud2.influxdata.com
+String influxUrl = "";
 String influxOrg = "";
 String influxBucket = "smartfarm";
 String influxToken = "";
 unsigned long lastInfluxWrite = 0;
-const unsigned long INFLUX_INTERVAL_MS = 60000UL; // 1 min
+const unsigned long INFLUX_INTERVAL_MS = 60000UL;
 
 // ====== Scheduled Reboot ======
 bool   scheduledRebootEnabled = false;
-int    scheduledRebootWeekday = 1;  // 0=Sun, 1=Mon, ..., 6=Sat
-int    scheduledRebootHour = 3;     // 3 AM
+int    scheduledRebootWeekday = 1;
+int    scheduledRebootHour = 3;
 bool   lastScheduledRebootCheck = false;
 unsigned long lastRebootCheckMinute = 0;
 
 // ====== Status LED ======
 unsigned long lastLedUpdate = 0;
 int ledState = LOW;
-unsigned long ledBlinkInterval = 1000;  // ms, changes based on state
+unsigned long ledBlinkInterval = 1000;
 
 // ====== Rate Limiting ======
-// Per-IP failed auth attempts; after 5 fails within 60s, block for 60s
 struct RateLimitEntry {
   IPAddress ip;
   int failCount;
@@ -1157,8 +1135,6 @@ void onPumpTurnedOff() {
 
 // ====== Access Log ======
 void logAccess(const String& entry) {
-  if (!LittleFS.begin(true)) return;
-  // Truncate if too large
   if (LittleFS.exists(ACCESS_LOG_FILE)) {
     File f = LittleFS.open(ACCESS_LOG_FILE, "r");
     if (f && f.size() > MAX_ACCESS_LOG_SIZE) {
@@ -1180,7 +1156,6 @@ String getAccessLogTail(int lines) {
   File f = LittleFS.open(ACCESS_LOG_FILE, "r");
   if (!f) return "(failed to open log)";
 
-  // Read all lines into a circular buffer
   String *buffer = new String[lines];
   int idx = 0, count = 0;
   while (f.available()) {
@@ -1215,7 +1190,6 @@ RateLimitEntry* findFreeRateLimitSlot() {
   for (int i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
     if (rateLimits[i].ip == IPAddress(0, 0, 0, 0)) return &rateLimits[i];
   }
-  // No free slot — evict the oldest expired entry
   for (int i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
     if (millis() > rateLimits[i].blockedUntil && rateLimits[i].failCount == 0) {
       rateLimits[i].ip = IPAddress(0, 0, 0, 0);
@@ -1229,7 +1203,6 @@ bool isRateLimited(IPAddress ip) {
   RateLimitEntry* entry = findRateLimit(ip);
   if (!entry) return false;
   if (millis() < entry->blockedUntil) return true;
-  // Reset if window passed
   if (millis() - entry->firstFailTime > 60000UL) {
     entry->failCount = 0;
     entry->firstFailTime = 0;
@@ -1253,7 +1226,7 @@ void recordAuthFailure(IPAddress ip) {
   }
   entry->failCount++;
   if (entry->failCount >= 5) {
-    entry->blockedUntil = millis() + 60000UL;  // block 60s
+    entry->blockedUntil = millis() + 60000UL;
     logAccess("Rate limit triggered for " + ip.toString() + " (5 failed auth attempts)");
   }
 }
@@ -1340,10 +1313,9 @@ void buildWeatherURL() {
   forecastURL = "https://api.openweathermap.org/data/2.5/forecast?q=" + city + "," + countryCode + "&appid=" + apiKey + "&units=metric";
 }
 
-// ====== Auth + CSRF (with rate limiting) ======
+// ====== Auth + CSRF ======
 bool requireAuth() {
   IPAddress ip = server.client().remoteIP();
-  // Check rate limit first
   if (isRateLimited(ip)) {
     server.send(429, "application/json", "{\"success\":false,\"error\":\"rate limited\"}");
     return false;
@@ -1365,7 +1337,6 @@ bool requireCsrf() {
   return true;
 }
 
-// ====== Combined auth+log helper ======
 bool requireAuthLogged(const String& action) {
   bool ok = requireAuth();
   if (ok) {
@@ -1376,7 +1347,7 @@ bool requireAuthLogged(const String& action) {
   return ok;
 }
 
-// ====== TLS-aware HTTPS client factory (for OUTBOUND calls only) ======
+// ====== TLS-aware HTTPS client factory ======
 WiFiClientSecure createSecureClient() {
   WiFiClientSecure client;
   if (validateTlsCert && rootCaPem.length() > 0) {
@@ -1392,7 +1363,7 @@ void getWeatherData() {
   if (WiFi.status() != WL_CONNECTED || apiKey.length() < 10) return;
   WiFiClientSecure client = createSecureClient();
   HTTPClient http;
-  http.setTimeout(8000);
+  http.setTimeout(3000);
   http.begin(client, weatherURL);
   int code = http.GET();
   if (code == 200) {
@@ -1414,7 +1385,7 @@ void getForecastData() {
   if (WiFi.status() != WL_CONNECTED || apiKey.length() < 10) return;
   WiFiClientSecure client = createSecureClient();
   HTTPClient http;
-  http.setTimeout(10000);
+  http.setTimeout(3000);
   http.begin(client, forecastURL);
   int code = http.GET();
   if (code == 200) {
@@ -1475,20 +1446,19 @@ bool isWithinWateringWindow() {
 // ====== Scheduled Reboot Check ======
 void checkScheduledReboot() {
   if (!scheduledRebootEnabled) return;
-  // Run this check at most once per minute
   unsigned long nowMin = millis() / 60000UL;
   if (nowMin == lastRebootCheckMinute) return;
   lastRebootCheckMinute = nowMin;
 
   int wd = getLocalWeekday();
   int hr = getLocalHour();
-  if (wd < 0 || hr < 0) return;  // NTP not synced
+  if (wd < 0 || hr < 0) return;
 
   if (wd == scheduledRebootWeekday && hr == scheduledRebootHour) {
     if (!lastScheduledRebootCheck) {
       lastScheduledRebootCheck = true;
       logAccess("Scheduled reboot triggered");
-      sendAlert(ALERT_BOOT);  // send pre-reboot alert
+      sendAlert(ALERT_BOOT);
       delay(500);
       ESP.restart();
     }
@@ -1504,19 +1474,18 @@ void updateStatusLed() {
   ledState = !ledState;
   digitalWrite(STATUS_LED_PIN, ledState);
 
-  // Determine blink interval based on system state
   if (dhtFault || moistureFault) {
-    ledBlinkInterval = 100;   // fast blink: sensor fault
+    ledBlinkInterval = 100;
   } else if (safetyTrip) {
-    ledBlinkInterval = 250;   // medium-fast: safety trip
+    ledBlinkInterval = 250;
   } else if (WiFi.status() != WL_CONNECTED) {
-    ledBlinkInterval = 200;   // fast: WiFi issue
+    ledBlinkInterval = 200;
   } else if (mqttEnabled && !mqtt.connected()) {
-    ledBlinkInterval = 500;   // medium: MQTT issue
+    ledBlinkInterval = 500;
   } else if (watering) {
-    ledBlinkInterval = 1000;  // slow: watering
+    ledBlinkInterval = 1000;
   } else {
-    ledBlinkInterval = 3000;  // very slow: idle/OK
+    ledBlinkInterval = 3000;
   }
 }
 
@@ -1711,15 +1680,12 @@ void publishMqttSensorData() {
   mqtt.publish((base + "relay").c_str(), watering ? "ON" : "OFF", true);
 
   DynamicJsonDocument doc(512);
-  if (isnan(cachedTemp))
-    doc["temperature"] = 0;
-  else
-    doc["temperature"] = cachedTemp;
+  if (isnan(cachedTemp)) doc["temperature"] = 0;
+  else doc["temperature"] = cachedTemp;
 
-  if (isnan(cachedHum))
-    doc["humidity"] = 0;
-  else
-    doc["humidity"] = cachedHum;
+  if (isnan(cachedHum)) doc["humidity"] = 0;
+  else doc["humidity"] = cachedHum;
+  
   doc["moisture"]    = m;
   doc["watering"]    = watering;
   doc["auto_mode"]   = autoMode;
@@ -1739,7 +1705,7 @@ bool sendTelegramMessage(const String& text) {
 
   WiFiClientSecure client = createSecureClient();
   HTTPClient http;
-  http.setTimeout(10000);
+  http.setTimeout(3000);
   String url = "https://api.telegram.org/bot" + telegramBotToken + "/sendMessage";
   http.begin(client, url);
 
@@ -1763,8 +1729,6 @@ bool pushToInflux() {
   if (millis() - lastInfluxWrite < INFLUX_INTERVAL_MS) return false;
   lastInfluxWrite = millis();
 
-  // Build line protocol payload
-  // Format: measurement,tag=value field=value timestamp
   String payload;
   payload += "sensor,device=smartfarm ";
   if (!isnan(cachedTemp)) payload += "temperature=" + String(cachedTemp, 2) + ",";
@@ -1773,16 +1737,14 @@ bool pushToInflux() {
   if (m >= 0) payload += "moisture=" + String(m, 2) + ",";
   payload += "watering=" + String(watering ? "1i" : "0i") + ",";
   payload += "auto_mode=" + String(autoMode ? "1i" : "0i");
-  // We always end with auto_mode, no trailing comma
 
-  // Build URL
   String url = influxUrl;
   if (!url.endsWith("/")) url += "/";
   url += "api/v2/write?org=" + influxOrg + "&bucket=" + influxBucket + "&precision=s";
 
   WiFiClientSecure client = createSecureClient();
   HTTPClient http;
-  http.setTimeout(10000);
+  http.setTimeout(3000);
   http.begin(client, url);
   http.addHeader("Authorization", "Token " + influxToken);
   http.addHeader("Content-Type", "text/plain; charset=utf-8");
@@ -1809,7 +1771,7 @@ bool pushTestToInflux() {
 
   WiFiClientSecure client = createSecureClient();
   HTTPClient http;
-  http.setTimeout(10000);
+  http.setTimeout(3000);
   http.begin(client, url);
   http.addHeader("Authorization", "Token " + influxToken);
   http.addHeader("Content-Type", "text/plain; charset=utf-8");
@@ -1838,7 +1800,6 @@ void setup() {
   loadConfig();
   setupLittleFS();
 
-  // Init rate limit array
   for (int i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
     rateLimits[i].ip = IPAddress(0, 0, 0, 0);
     rateLimits[i].failCount = 0;
@@ -1846,7 +1807,6 @@ void setup() {
     rateLimits[i].blockedUntil = 0;
   }
 
-  // WiFiManager captive portal
   WiFi.mode(WIFI_STA);
   WiFiManager wm;
   wm.setConfigPortalTimeout(180);
@@ -1862,7 +1822,6 @@ void setup() {
   if (MDNS.begin("project")) Serial.println(F("[mDNS] http://project.local/"));
   else Serial.println(F("[mDNS] failed."));
 
-  // NTP sync
   Serial.println(F("[NTP] Configuring time..."));
   configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
 
@@ -1883,42 +1842,7 @@ void setup() {
   setupMqtt();
 
   logAccess("Device booted");
-    // ====== Lightweight Built-in OTA ======
-  server.on("/update", HTTP_GET, []() {
-    if (!requireAuth()) return;
-    String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
-    html += "<style>body{font-family:Arial,sans-serif;background:#f5f5f5;padding:20px;text-align:center;}";
-    html += ".btn{padding:10px 20px;background:#3498db;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:16px;}";
-    html += "</style></head><body>";
-    html += "<h2>ESP32-S3 Firmware Update</h2>";
-    html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
-    html += "<input type='file' name='update' accept='.bin' style='margin:10px;'>";
-    html += "<br><input type='submit' value='Upload & Flash' class='btn'></form>";
-    html += "<p>Only upload .bin files compiled for ESP32-S3.</p>";
-    html += "</body></html>";
-    server.send(200, "text/html", html);
-  });
-
-  server.on("/update", HTTP_POST, []() {
-    if (!requireAuth()) return;
-    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
-    delay(1000);
-    ESP.restart();
-  }, []() {
-    HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) {
-      Serial.printf("Update: %s\n", upload.filename.c_str());
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); }
-    } else if (upload.status == UPLOAD_FILE_WRITE) {
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.printError(Serial); }
-    } else if (upload.status == UPLOAD_FILE_END) {
-      if (Update.end(true)) { Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize); } 
-      else { Update.printError(Serial); }
-    }
-  });
-
-  server.begin();
-  Serial.println(F("[HTTP] server started on port 80"));
+  Serial.println(F("[HTTP] Web UI will be served on port 80 only (no local HTTPS)"));
 
   // ====== Routes ======
   server.on("/", HTTP_GET, [](){
@@ -2296,7 +2220,6 @@ void setup() {
     ESP.restart();
   });
 
-  // Access log endpoints
   server.on("/logs", HTTP_GET, [](){
     if (!requireAuth()) return;
     String log = getAccessLogTail(50);
@@ -2311,18 +2234,14 @@ void setup() {
     server.send(200, "application/json", "{\"success\":true}");
   });
 
-  // Factory Reset
   server.on("/factory-reset", HTTP_POST, [](){
     if (!requireAuth()) return;
     if (!requireCsrf()) return;
     logAccess("FACTORY RESET triggered by " + server.client().remoteIP().toString());
-    // Wipe NVS
     preferences.begin("watering", false);
     preferences.clear();
     preferences.end();
-    // Wipe LittleFS
     LittleFS.format();
-    // Wipe WiFi config
     WiFiManager wm;
     wm.resetSettings();
     server.send(200, "application/json", "{\"success\":true}");
@@ -2367,9 +2286,42 @@ void setup() {
     server.send(200, "application/json", out);
   });
 
-  // // ElegantOTA setup
-  // ElegantOTA.begin(&server);    // Start ElegantOTA
-  // ElegantOTA.setAuth("admin", "admin"); // Optional: uncomment to password protect OTA));
+  // ====== Lightweight Built-in OTA ======
+  server.on("/update", HTTP_GET, []() {
+    if (!requireAuth()) return;
+    String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body{font-family:Arial,sans-serif;background:#f5f5f5;padding:20px;text-align:center;}";
+    html += ".btn{padding:10px 20px;background:#3498db;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:16px;}";
+    html += "</style></head><body>";
+    html += "<h2>ESP32-S3 Firmware Update</h2>";
+    html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+    html += "<input type='file' name='update' accept='.bin' style='margin:10px;'>";
+    html += "<br><input type='submit' value='Upload & Flash' class='btn'></form>";
+    html += "<p>Only upload .bin files compiled for ESP32-S3.</p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/update", HTTP_POST, []() {
+    if (!requireAuth()) return;
+    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+    delay(1000);
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("Update: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.printError(Serial); }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) { Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize); } 
+      else { Update.printError(Serial); }
+    }
+  });
+
+  server.begin();
+  Serial.println(F("[HTTP] server started on port 80"));
 
   sendAlert(ALERT_BOOT);
 }
@@ -2377,13 +2329,12 @@ void setup() {
 // ====== Loop ======
 void loop() {
   server.handleClient();
-  // ElegantOTA.loop();       //Elegant OTA added
+  
   updateDhtCache();
   checkWifiReconnect();
   updateStatusLed();
   checkScheduledReboot();
 
-  // MQTT maintenance
   if (mqttEnabled) {
     if (!mqtt.connected()) {
       if (mqttConnectedNow) {
@@ -2397,12 +2348,10 @@ void loop() {
     }
   }
 
-  // InfluxDB push
   if (influxEnabled) {
     pushToInflux();
   }
 
-  // Auto watering logic
   if (autoMode) {
     bool inWindow = isWithinWateringWindow();
     bool canWater = inWindow && !rainExpected && !moistureFault;
@@ -2426,7 +2375,6 @@ void loop() {
     }
   }
 
-  // Max watering duration safety cutoff
   if (watering && (millis() - wateringStartTime > MAX_WATER_TIME_MS)) {
     onPumpTurnedOff();
     watering = false;
@@ -2437,10 +2385,8 @@ void loop() {
     saveConfigToNvs();
   }
 
-  // Periodic history logging
   logSensorData();
 
-  // Periodic weather + forecast refresh
   if (WiFi.status() == WL_CONNECTED) {
     if (millis() - lastWeatherUpdate > WEATHER_INTERVAL_MS) getWeatherData();
     if (millis() - lastForecastUpdate > FORECAST_INTERVAL_MS) getForecastData();
