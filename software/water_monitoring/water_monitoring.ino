@@ -1,17 +1,30 @@
 // =============================================================================
 // Smart Agricultural System - ESP32-S3
-// Water Monitoring + Auto Irrigation + Live Weather + OTA + Trends + Cloud
+// Water Monitoring + Auto Irrigation + Weather + Trends + Cloud + Hardening
 // -----------------------------------------------------------------------------
-// P3 FEATURES APPLIED (on top of P0 + P1 + P2):
+// This build serves the local web UI over plain HTTP only (port 80).
+// The experimental local-HTTPS server (self-signed cert on port 443) has been
+// removed - it never worked correctly (the cert/key were placeholders and the
+// SSL API calls used on AsyncWebServer do not exist), so it has been dropped
+// in favor of a clean, working HTTP-only server.
 //
-//   P3-1: MQTT integration (publish sensors, subscribe to commands)
-//   P3-2: Telegram alerts (push notifications for faults and events)
-//   P3-3: TLS cert validation (user-configurable CA via web UI, replaces
-//         setInsecure() when enabled)
-//   P3-4: Diagnostics dashboard (uptime, heap, RSSI, FS usage, MQTT state)
-//   P3-5: Pump cycle counter (total cycles + runtime, persisted to NVS)
-//   P3-6: Backup/Restore configuration (JSON export/import)
-//   P3-7: CSV data export (download history as CSV file)
+// Outbound calls to cloud services (OpenWeatherMap, Telegram, InfluxDB) still
+// use HTTPS via WiFiClientSecure, since those providers require it. That is
+// unrelated to - and unaffected by - removing the local HTTPS server.
+//
+// FEATURES:
+//   - Soil moisture + DHT11 temperature/humidity monitoring with fault detection
+//   - Auto irrigation with scheduled watering window + rain-forecast pause
+//   - OpenWeatherMap current conditions + 3h rain forecast
+//   - 24h trend chart + CSV export, logged to LittleFS
+//   - MQTT publish/subscribe integration
+//   - Telegram alerts
+//   - InfluxDB v2 cloud push
+//   - Access log to LittleFS + /logs endpoint
+//   - Scheduled weekly reboot
+//   - Status LED (GPIO 2) indicating WiFi/MQTT/fault state
+//   - Factory reset endpoint (wipes NVS + LittleFS, reboots to captive portal)
+//   - Rate limiting on auth failures (anti-brute-force)
 // =============================================================================
 
 // ====== Includes ======
@@ -20,28 +33,29 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncTCP.h>
+#include <WebServer.h>
 #include <DHT.h>
 #include <ESPmDNS.h>
 #include <WiFiManager.h>
-#include <AsyncElegantOTA.h>
 #include <LittleFS.h>
 #include <time.h>
-#include <PubSubClient.h>     // P3-1: MQTT
+#include <PubSubClient.h>
+// #include <ElegantOTA.h>
+#include <Update.h>
 
 // ====== Hardware Pins (ESP32-S3) ======
 #define DHTPIN 4
 #define DHTTYPE DHT11
 #define MOISTURE_PIN 1
 #define RELAY_PIN 8
+#define STATUS_LED_PIN 2              // Status LED (built-in LED on most S3 boards)
 
 // ====== Objects ======
 DHT dht(DHTPIN, DHTTYPE);
 Preferences preferences;
-AsyncWebServer server(80);
+WebServer server(80);            // HTTP only
 WiFiClient mqttWifiClient;
-PubSubClient mqtt(mqttWifiClient);   // P3-1
+PubSubClient mqtt(mqttWifiClient);
 
 // ====== Device Configuration (loaded from NVS at boot) =====================
 String apiKey       = "";
@@ -104,7 +118,7 @@ const unsigned long WIFI_CHECK_INTERVAL_MS = 10000UL;
 unsigned long lastWifiDisconnect = 0;
 bool wifiWasDisconnected = false;
 
-// ====== P3-1: MQTT Config ======
+// ====== MQTT Config ======
 String mqttBroker = "";
 int    mqttPort = 1883;
 String mqttUser = "";
@@ -118,48 +132,40 @@ const unsigned long MQTT_PUBLISH_INTERVAL_MS = 30000UL;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000UL;
 const size_t       MQTT_MAX_PACKET = 1024;
 
-// ====== P3-2: Telegram Config ======
+// ====== Telegram Config ======
 String telegramBotToken = "";
 String telegramChatId = "";
 bool   telegramEnabled = false;
-// Per-alert-type cooldown tracking
 unsigned long lastTelegramAlert[12] = {0};
-const unsigned long TELEGRAM_COOLDOWN_MS = 300000UL; // 5 min between same alert
+const unsigned long TELEGRAM_COOLDOWN_MS = 300000UL;
 
 enum AlertType {
-  ALERT_DHT_FAULT = 0,
-  ALERT_DHT_RECOVER,
-  ALERT_MOISTURE_FAULT,
-  ALERT_MOISTURE_RECOVER,
-  ALERT_SAFETY_TRIP,
-  ALERT_WATERING_START,
-  ALERT_WATERING_STOP,
-  ALERT_WIFI_DISCONNECT,
-  ALERT_WIFI_RECONNECT,
-  ALERT_MQTT_DISCONNECT,
-  ALERT_BOOT,
-  ALERT_COUNT
+  ALERT_DHT_FAULT = 0, ALERT_DHT_RECOVER, ALERT_MOISTURE_FAULT,
+  ALERT_MOISTURE_RECOVER, ALERT_SAFETY_TRIP, ALERT_WATERING_START,
+  ALERT_WATERING_STOP, ALERT_WIFI_DISCONNECT, ALERT_WIFI_RECONNECT,
+  ALERT_MQTT_DISCONNECT, ALERT_BOOT, ALERT_COUNT
 };
 
-// ====== P3-3: TLS Cert Validation ======
+// ====== TLS Cert Validation (for OUTBOUND HTTPS calls to cloud APIs) ======
 bool   validateTlsCert = false;
 String rootCaPem = "";
 
-// ====== P3-5: Pump Cycle Counter ======
+// ====== Pump Cycle Counter ======
 unsigned int pumpCycles = 0;
 unsigned long pumpTotalRuntimeSec = 0;
-unsigned long lastPumpNvsSave = 0;
-const unsigned long PUMP_NVS_SAVE_INTERVAL_MS = 60000UL; // persist every 60s while running
+unsigned long pumpStartTime = 0;
 
-// ====== P3-4: Diagnostics ======
+// ====== Diagnostics ======
 unsigned long bootTime = 0;
 String lastBootTimeStr = "—";
 
 // ====== History Logging ======
 const char* LOG_FILE = "/log.csv";
+const char* ACCESS_LOG_FILE = "/access.log";
 const unsigned long LOG_INTERVAL_MS = 60000UL;
 unsigned long lastLogTime = 0;
 const size_t  MAX_LOG_SIZE = 200000;
+const size_t  MAX_ACCESS_LOG_SIZE = 50000;
 
 // ====== NTP / Time ======
 const long  GMT_OFFSET_SEC = 19800;
@@ -181,6 +187,13 @@ int getLocalHour() {
   return timeinfo.tm_hour;
 }
 
+int getLocalWeekday() {
+  // Returns 0=Sunday, 1=Monday, ..., 6=Saturday
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 5000)) return -1;
+  return timeinfo.tm_wday;
+}
+
 String getIsoTimestamp() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 2000)) return String(millis());
@@ -188,6 +201,38 @@ String getIsoTimestamp() {
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
   return String(buf);
 }
+
+// ====== InfluxDB Config ======
+bool   influxEnabled = false;
+String influxUrl = "";           // e.g. https://eu-central-1-1.aws.cloud2.influxdata.com
+String influxOrg = "";
+String influxBucket = "smartfarm";
+String influxToken = "";
+unsigned long lastInfluxWrite = 0;
+const unsigned long INFLUX_INTERVAL_MS = 60000UL; // 1 min
+
+// ====== Scheduled Reboot ======
+bool   scheduledRebootEnabled = false;
+int    scheduledRebootWeekday = 1;  // 0=Sun, 1=Mon, ..., 6=Sat
+int    scheduledRebootHour = 3;     // 3 AM
+bool   lastScheduledRebootCheck = false;
+unsigned long lastRebootCheckMinute = 0;
+
+// ====== Status LED ======
+unsigned long lastLedUpdate = 0;
+int ledState = LOW;
+unsigned long ledBlinkInterval = 1000;  // ms, changes based on state
+
+// ====== Rate Limiting ======
+// Per-IP failed auth attempts; after 5 fails within 60s, block for 60s
+struct RateLimitEntry {
+  IPAddress ip;
+  int failCount;
+  unsigned long firstFailTime;
+  unsigned long blockedUntil;
+};
+const int MAX_RATE_LIMIT_ENTRIES = 8;
+RateLimitEntry rateLimits[MAX_RATE_LIMIT_ENTRIES];
 
 // ====== HTML (single page app) ======
 const char index_html[] PROGMEM = R"rawliteral(
@@ -243,7 +288,7 @@ textarea.input{font-family:monospace;font-size:11px}
 .danger-box{background:#f8d7da;border:1px solid #f1aeb5;color:#58151c;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 .info-box{background:#d1ecf1;border:1px solid #bee5eb;color:#0c5460;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 .chart-container{position:relative;height:300px}
-.muted{opacity:.6;font-size:11px}
+.log-viewer{background:#1e1e1e;color:#d4d4d4;padding:12px;border-radius:8px;font-family:monospace;font-size:11px;max-height:300px;overflow-y:auto;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -251,7 +296,7 @@ textarea.input{font-family:monospace;font-size:11px}
 
   <header>
     <h1>Smart Agricultural System</h1>
-    <div class="small">ESP32-S3 • DHT11 + Soil Moisture + Relay • Weather + Trends + MQTT + Alerts + OTA</div>
+    <div class="small">ESP32-S3 • Cloud + Hardening • Weather + Trends + MQTT + Alerts + InfluxDB + OTA</div>
     <div class="small" id="clock" style="margin-top:4px">—</div>
   </header>
 
@@ -344,12 +389,24 @@ textarea.input{font-family:monospace;font-size:11px}
     <div class="kv"><span>IP Address</span><span id="diag-ip">—</span></div>
     <div class="kv"><span>LittleFS Used</span><span id="diag-fs">—</span></div>
     <div class="kv"><span>MQTT Status</span><span id="diag-mqtt">—</span></div>
+    <div class="kv"><span>InfluxDB Status</span><span id="diag-influx">—</span></div>
     <div class="kv"><span>Pump Cycles</span><span id="diag-cycles">—</span></div>
     <div class="kv"><span>Pump Total Runtime</span><span id="diag-runtime">—</span></div>
+    <div class="kv"><span>LED State</span><span id="diag-led">—</span></div>
     <div class="kv"><span>Last Boot</span><span id="diag-boot">—</span></div>
+    <div class="kv"><span>Scheduled Reboot</span><span id="diag-sched">—</span></div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-primary" id="diag-refresh">Refresh</button>
       <button class="btn btn-warn" id="diag-reboot">Reboot Device</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Access Log (last 50 events)</h2>
+    <div class="log-viewer" id="access-log">Loading...</div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-primary" id="refresh-logs">Refresh Logs</button>
+      <button class="btn btn-warn" id="clear-logs">Clear Logs</button>
     </div>
   </div>
 
@@ -375,7 +432,26 @@ textarea.input{font-family:monospace;font-size:11px}
         <input id="water-end-hour" class="input" type="number" step="1" min="0" max="23" />
       </div>
     </div>
-    <div class="notice">If start == end, watering is allowed any time.</div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Scheduled Reboot</label>
+        <select id="sched-reboot-enabled" class="input">
+          <option value="false">Disabled</option>
+          <option value="true">Enabled</option>
+        </select>
+      </div>
+      <div>
+        <label>Reboot Day (0=Sun, 6=Sat)</label>
+        <input id="sched-reboot-day" class="input" type="number" step="1" min="0" max="6" />
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Reboot Hour (0-23)</label>
+        <input id="sched-reboot-hour" class="input" type="number" step="1" min="0" max="23" />
+      </div>
+      <div></div>
+    </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-settings">Save</button>
     </div>
@@ -422,7 +498,7 @@ textarea.input{font-family:monospace;font-size:11px}
         <input id="cfg-auth-pass" class="input" type="password" placeholder="••••••" />
       </div>
       <div>
-        <label>Validate TLS Cert (advanced)</label>
+        <label>Validate TLS Cert for outbound calls (advanced)</label>
         <select id="cfg-tls-validate" class="input">
           <option value="false">Disabled (insecure, default)</option>
           <option value="true">Enabled (paste root CA below)</option>
@@ -431,8 +507,7 @@ textarea.input{font-family:monospace;font-size:11px}
     </div>
     <div style="margin-top:10px">
       <label>Root CA Certificate (PEM format, optional)</label>
-      <textarea id="cfg-root-ca" class="input" rows="4" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
-      <div class="notice">Get the cert with: <code>openssl s_client -showcerts -connect api.openweathermap.org:443 &lt;/dev/null 2&gt;/dev/null | openssl x509 -outform PEM</code></div>
+      <textarea id="cfg-root-ca" class="input" rows="3" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
     </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-config">Save Configuration</button>
@@ -440,6 +515,16 @@ textarea.input{font-family:monospace;font-size:11px}
       <a class="btn btn-primary" href="/update" target="_blank">OTA Update</a>
       <button class="btn btn-primary" id="backup-config">Backup Config</button>
       <button class="btn btn-warn" id="restore-config">Restore Config</button>
+      <button class="btn btn-danger" id="factory-reset">Factory Reset</button>
+    </div>
+    <div class="warn-box" style="margin-top:10px">
+      <strong>Note:</strong> The web UI is served over plain HTTP on your local network.
+      Credentials are sent with HTTP Basic Auth, which is not encrypted on the wire —
+      only use this on a trusted local network.
+    </div>
+    <div class="danger-box" style="margin-top:8px">
+      <strong>Factory Reset:</strong> Wipes ALL data (NVS, LittleFS, WiFi config, sensor logs).
+      Device reboots into captive portal. Use only as last resort.
     </div>
   </div>
 
@@ -455,7 +540,7 @@ textarea.input{font-family:monospace;font-size:11px}
       </div>
       <div>
         <label>Broker Host</label>
-        <input id="cfg-mqtt-broker" class="input" type="text" placeholder="broker.hivemq.com or 192.168.1.50" />
+        <input id="cfg-mqtt-broker" class="input" type="text" placeholder="broker.hivemq.com" />
       </div>
     </div>
     <div class="form-row" style="margin-top:10px">
@@ -499,20 +584,56 @@ textarea.input{font-family:monospace;font-size:11px}
       </div>
       <div>
         <label>Chat ID</label>
-        <input id="cfg-tg-chat" class="input" type="text" placeholder="e.g. 123456789" />
+        <input id="cfg-tg-chat" class="input" type="text" placeholder="123456789" />
       </div>
     </div>
     <div style="margin-top:10px">
       <label>Bot Token</label>
-      <input id="cfg-tg-token" class="input" type="text" placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ" />
+      <input id="cfg-tg-token" class="input" type="text" placeholder="123456789:ABCdef..." />
     </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-telegram">Save Telegram Config</button>
       <button class="btn btn-primary" id="test-telegram">Send Test Alert</button>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>InfluxDB Cloud (v2)</h2>
+    <div class="form-row">
+      <div>
+        <label>Enable InfluxDB</label>
+        <select id="cfg-influx-enabled" class="input">
+          <option value="false">Disabled</option>
+          <option value="true">Enabled</option>
+        </select>
+      </div>
+      <div>
+        <label>Bucket</label>
+        <input id="cfg-influx-bucket" class="input" type="text" placeholder="smartfarm" />
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Organization</label>
+        <input id="cfg-influx-org" class="input" type="text" placeholder="your-email@example.com" />
+      </div>
+      <div></div>
+    </div>
+    <div style="margin-top:10px">
+      <label>InfluxDB URL</label>
+      <input id="cfg-influx-url" class="input" type="text" placeholder="https://eu-central-1-1.aws.cloud2.influxdata.com" />
+    </div>
+    <div style="margin-top:10px">
+      <label>API Token</label>
+      <input id="cfg-influx-token" class="input" type="password" placeholder="your-influx-token-here" />
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-success" id="save-influx">Save InfluxDB Config</button>
+      <button class="btn btn-primary" id="test-influx">Send Test Point</button>
+    </div>
     <div class="notice">
-      Create a bot via <a href="https://t.me/BotFather" target="_blank">@BotFather</a> to get a token.
-      Message <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a> to get your Chat ID.
+      Pushes sensor data every 60s using <a href="https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/" target="_blank">line protocol</a>.
+      Get a free account at <a href="https://cloud2.influxdata.com" target="_blank">cloud2.influxdata.com</a>.
     </div>
   </div>
 
@@ -520,7 +641,6 @@ textarea.input{font-family:monospace;font-size:11px}
 
 <script>
 const CSRF_HEADER = {'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'};
-
 const $ = id => document.getElementById(id);
 
 const temperatureEl = $('temperature'), humidityEl = $('humidity'), moistureEl = $('moisture');
@@ -535,7 +655,7 @@ const cfgApiKey = $('cfg-api-key'), cfgCity = $('cfg-city'), cfgCountry = $('cfg
 const cfgAuthUser = $('cfg-auth-user'), cfgAuthPass = $('cfg-auth-pass');
 const cfgTlsValidate = $('cfg-tls-validate'), cfgRootCa = $('cfg-root-ca');
 const saveCfgBtn = $('save-config'), resetWifiBtn = $('reset-wifi');
-const backupBtn = $('backup-config'), restoreBtn = $('restore-config');
+const backupBtn = $('backup-config'), restoreBtn = $('restore-config'), factoryResetBtn = $('factory-reset');
 const safetyWarn = $('safety-warn'), defaultCredsWarn = $('default-creds-warn');
 const faultWarn = $('fault-warn'), faultDetail = $('fault-detail');
 const tempFaultBadge = $('temp-fault'), humFaultBadge = $('hum-fault'), moistFaultBadge = $('moist-fault');
@@ -544,6 +664,8 @@ const calibDryBtn = $('calib-dry-btn'), calibWetBtn = $('calib-wet-btn'), calibR
 const refreshChartBtn = $('refresh-chart');
 const diagRefresh = $('diag-refresh'), diagReboot = $('diag-reboot');
 const saveMqttBtn = $('save-mqtt'), saveTelegramBtn = $('save-telegram'), testTelegramBtn = $('test-telegram');
+const saveInfluxBtn = $('save-influx'), testInfluxBtn = $('test-influx');
+const refreshLogsBtn = $('refresh-logs'), clearLogsBtn = $('clear-logs');
 let trendsChart = null;
 let moistureThreshold = 30, humidityThreshold = 50;
 
@@ -596,6 +718,9 @@ function loadSettings(){
     humInp.value = humidityThreshold;
     waterStartInp.value = s.watering_start_hour ?? 6;
     waterEndInp.value = s.watering_end_hour ?? 8;
+    $('sched-reboot-enabled').value = s.scheduled_reboot_enabled ? 'true' : 'false';
+    $('sched-reboot-day').value = s.scheduled_reboot_weekday ?? 1;
+    $('sched-reboot-hour').value = s.scheduled_reboot_hour ?? 3;
   }).catch(()=>{});
 }
 
@@ -604,7 +729,10 @@ function saveSettings(){
     moisture_threshold: parseFloat(moistInp.value||30),
     humidity_threshold: parseFloat(humInp.value||50),
     watering_start_hour: parseInt(waterStartInp.value||0),
-    watering_end_hour: parseInt(waterEndInp.value||0)
+    watering_end_hour: parseInt(waterEndInp.value||0),
+    scheduled_reboot_enabled: $('sched-reboot-enabled').value === 'true',
+    scheduled_reboot_weekday: parseInt($('sched-reboot-day').value||1),
+    scheduled_reboot_hour: parseInt($('sched-reboot-hour').value||3)
   };
   fetch('/settings',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
     .then(r=>r.json()).then(_=>loadSettings()).catch(()=>{});
@@ -634,19 +762,20 @@ function loadConfig(){
     cfgRootCa.value = c.root_ca || '';
     if (c.auth_user === 'admin' && c.using_default_pass) defaultCredsWarn.style.display = 'block';
     else defaultCredsWarn.style.display = 'none';
-
-    // MQTT
     $('cfg-mqtt-enabled').value = c.mqtt_enabled ? 'true' : 'false';
     $('cfg-mqtt-broker').value = c.mqtt_broker || '';
     $('cfg-mqtt-port').value = c.mqtt_port || 1883;
     $('cfg-mqtt-prefix').value = c.mqtt_prefix || 'smartfarm';
     $('cfg-mqtt-user').value = c.mqtt_user || '';
     $('cfg-mqtt-pass').value = '';
-
-    // Telegram
     $('cfg-tg-enabled').value = c.telegram_enabled ? 'true' : 'false';
     $('cfg-tg-chat').value = c.telegram_chat_id || '';
     $('cfg-tg-token').value = c.telegram_bot_token || '';
+    $('cfg-influx-enabled').value = c.influx_enabled ? 'true' : 'false';
+    $('cfg-influx-url').value = c.influx_url || '';
+    $('cfg-influx-org').value = c.influx_org || '';
+    $('cfg-influx-bucket').value = c.influx_bucket || 'smartfarm';
+    $('cfg-influx-token').value = c.influx_token || '';
   }).catch(()=>{});
 }
 
@@ -657,9 +786,23 @@ function saveConfig(){
     country: cfgCountry.value.toUpperCase(),
     auth_user: cfgAuthUser.value,
     validate_tls_cert: cfgTlsValidate.value === 'true',
-    root_ca: cfgRootCa.value
+    root_ca: cfgRootCa.value,
+    mqtt_enabled: $('cfg-mqtt-enabled').value === 'true',
+    mqtt_broker: $('cfg-mqtt-broker').value,
+    mqtt_port: parseInt($('cfg-mqtt-port').value || 1883),
+    mqtt_prefix: $('cfg-mqtt-prefix').value || 'smartfarm',
+    mqtt_user: $('cfg-mqtt-user').value,
+    telegram_enabled: $('cfg-tg-enabled').value === 'true',
+    telegram_chat_id: $('cfg-tg-chat').value,
+    telegram_bot_token: $('cfg-tg-token').value,
+    influx_enabled: $('cfg-influx-enabled').value === 'true',
+    influx_url: $('cfg-influx-url').value,
+    influx_org: $('cfg-influx-org').value,
+    influx_bucket: $('cfg-influx-bucket').value || 'smartfarm',
+    influx_token: $('cfg-influx-token').value
   };
   if (cfgAuthPass.value) body.auth_pass = cfgAuthPass.value;
+  if ($('cfg-mqtt-pass').value) body.mqtt_pass = $('cfg-mqtt-pass').value;
   fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
       if (d.success) {
@@ -680,7 +823,6 @@ function resetWifi(){
 saveCfgBtn.onclick = saveConfig;
 resetWifiBtn.onclick = resetWifi;
 
-// Backup / Restore
 backupBtn.onclick = ()=>{
   fetch('/backup').then(r=>r.json()).then(data=>{
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
@@ -713,7 +855,14 @@ restoreBtn.onclick = ()=>{
   input.click();
 };
 
-// MQTT
+factoryResetBtn.onclick = ()=>{
+  if (!confirm('FACTORY RESET will erase ALL data (NVS, LittleFS, logs, WiFi). Device will reboot into captive portal. Are you sure?')) return;
+  if (!confirm('This is your final warning. Continue with factory reset?')) return;
+  fetch('/factory-reset',{method:'POST',headers:CSRF_HEADER})
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('Factory reset complete. Rebooting...'); })
+    .catch(()=>{});
+};
+
 saveMqttBtn.onclick = ()=>{
   const body = {
     mqtt_enabled: $('cfg-mqtt-enabled').value === 'true',
@@ -724,13 +873,10 @@ saveMqttBtn.onclick = ()=>{
   };
   if ($('cfg-mqtt-pass').value) body.mqtt_pass = $('cfg-mqtt-pass').value;
   fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
-    .then(r=>r.json()).then(d=>{
-      if (d.success) alert('MQTT config saved.');
-      else alert('Failed: ' + (d.error || 'unknown'));
-    }).catch(()=>{ alert('Network error'); });
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('MQTT config saved.'); else alert('Failed: ' + (d.error || 'unknown')); })
+    .catch(()=>{ alert('Network error'); });
 };
 
-// Telegram
 saveTelegramBtn.onclick = ()=>{
   const body = {
     telegram_enabled: $('cfg-tg-enabled').value === 'true',
@@ -738,21 +884,39 @@ saveTelegramBtn.onclick = ()=>{
     telegram_bot_token: $('cfg-tg-token').value
   };
   fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
-    .then(r=>r.json()).then(d=>{
-      if (d.success) alert('Telegram config saved.');
-      else alert('Failed: ' + (d.error || 'unknown'));
-    }).catch(()=>{ alert('Network error'); });
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('Telegram config saved.'); else alert('Failed: ' + (d.error || 'unknown')); })
+    .catch(()=>{ alert('Network error'); });
 };
 
 testTelegramBtn.onclick = ()=>{
   fetch('/telegram/test',{method:'POST',headers:CSRF_HEADER})
     .then(r=>r.json()).then(d=>{
-      if (d.success) alert('Test alert sent. Check your Telegram.');
+      if (d.success) alert('Test alert sent.');
       else alert('Failed: ' + (d.error || 'unknown'));
     }).catch(()=>{ alert('Network error'); });
 };
 
-// Calibration
+saveInfluxBtn.onclick = ()=>{
+  const body = {
+    influx_enabled: $('cfg-influx-enabled').value === 'true',
+    influx_url: $('cfg-influx-url').value,
+    influx_org: $('cfg-influx-org').value,
+    influx_bucket: $('cfg-influx-bucket').value || 'smartfarm',
+    influx_token: $('cfg-influx-token').value
+  };
+  fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('InfluxDB config saved.'); else alert('Failed: ' + (d.error || 'unknown')); })
+    .catch(()=>{ alert('Network error'); });
+};
+
+testInfluxBtn.onclick = ()=>{
+  fetch('/influx/test',{method:'POST',headers:CSRF_HEADER})
+    .then(r=>r.json()).then(d=>{
+      if (d.success) alert('Test point sent. Check your InfluxDB bucket.');
+      else alert('Failed: ' + (d.error || 'unknown'));
+    }).catch(()=>{ alert('Network error'); });
+};
+
 function loadCalibration(){
   fetch('/calibrate').then(r=>r.json()).then(c=>{
     calibDry.textContent = c.dry ?? '—';
@@ -770,7 +934,6 @@ calibDryBtn.onclick = ()=>setCalibration('set_dry');
 calibWetBtn.onclick = ()=>setCalibration('set_wet');
 calibRefresh.onclick = ()=>{ updateSensorData(); loadCalibration(); };
 
-// Chart
 function fetchAndRenderChart(){
   fetch('/history?hours=24').then(r=>r.json()).then(data=>{
     const labels = data.map(p => p.t);
@@ -792,19 +955,21 @@ function fetchAndRenderChart(){
 }
 refreshChartBtn.onclick = fetchAndRenderChart;
 
-// Diagnostics
 function updateDiagnostics(){
   fetch('/diagnostics').then(r=>r.json()).then(d=>{
-    $('diag-uptime').textContent = d.uptime || '—';
+    $('diag-uptime').textContent = d.uptime ? `${Math.floor(d.uptime/3600)}h ${Math.floor((d.uptime%3600)/60)}m ${d.uptime%60}s` : '—';
     $('diag-heap').textContent = d.free_heap ? `${(d.free_heap/1024).toFixed(1)} KB` : '—';
     $('diag-rssi').textContent = (typeof d.rssi === 'number') ? `${d.rssi} dBm` : '—';
     $('diag-ssid').textContent = d.ssid || '—';
     $('diag-ip').textContent = d.ip || '—';
     $('diag-fs').textContent = d.fs_used ? `${(d.fs_used/1024).toFixed(0)} / ${(d.fs_total/1024).toFixed(0)} KB` : '—';
     $('diag-mqtt').textContent = d.mqtt_enabled ? (d.mqtt_connected ? 'Connected' : 'Disconnected') : 'Disabled';
+    $('diag-influx').textContent = d.influx_enabled ? 'Enabled' : 'Disabled';
     $('diag-cycles').textContent = d.pump_cycles ?? '—';
     $('diag-runtime').textContent = d.pump_runtime_sec ? `${Math.floor(d.pump_runtime_sec/60)} min ${d.pump_runtime_sec%60} s` : '—';
+    $('diag-led').textContent = d.led_state || '—';
     $('diag-boot').textContent = d.last_boot || '—';
+    $('diag-sched').textContent = d.scheduled_reboot_enabled ? `Every ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.scheduled_reboot_weekday]} at ${String(d.scheduled_reboot_hour).padStart(2,'0')}:00` : 'Disabled';
   }).catch(()=>{});
 }
 diagRefresh.onclick = updateDiagnostics;
@@ -815,12 +980,25 @@ diagReboot.onclick = ()=>{
   }).catch(()=>{});
 };
 
+function refreshLogs(){
+  fetch('/logs').then(r=>r.text()).then(t=>{
+    $('access-log').textContent = t || '(no log entries)';
+  }).catch(()=>{ $('access-log').textContent = 'Failed to load logs'; });
+}
+refreshLogsBtn.onclick = refreshLogs;
+clearLogsBtn.onclick = ()=>{
+  if (!confirm('Clear all access log entries?')) return;
+  fetch('/logs/clear',{method:'POST',headers:CSRF_HEADER}).then(r=>r.json()).then(d=>{
+    if (d.success) refreshLogs();
+  }).catch(()=>{});
+};
+
 function updateClock(){ fetch('/time').then(r=>r.json()).then(d=>{ clockEl.textContent = d.time || '—'; }).catch(()=>{}); }
 
 function init(){
   loadSettings(); loadConfig(); loadCalibration();
   updateSensorData(); updateSystemStatus(); fetchWeather();
-  fetchAndRenderChart(); updateClock(); updateDiagnostics();
+  fetchAndRenderChart(); updateClock(); updateDiagnostics(); refreshLogs();
   setInterval(()=>{ updateSensorData(); updateSystemStatus(); }, 5000);
   setInterval(()=>{ fetchWeather(); }, 600000);
   setInterval(()=>{ updateClock(); }, 30000);
@@ -831,6 +1009,54 @@ init();
 </body>
 </html>
 )rawliteral";
+
+// Forward declaration
+bool sendTelegramMessage(const String& text);
+
+void sendAlert(AlertType type) {
+  if (!telegramEnabled) return;
+  if (millis() - lastTelegramAlert[type] < TELEGRAM_COOLDOWN_MS) return;
+  lastTelegramAlert[type] = millis();
+
+  String msg = "🌱 <b>Smart Agricultural System</b>\n";
+  switch (type) {
+    case ALERT_DHT_FAULT:
+      msg += "⚠️ <b>Sensor Fault:</b> DHT11 not responding.";
+      break;
+    case ALERT_DHT_RECOVER:
+      msg += "✅ <b>Sensor Recovered:</b> DHT11 OK.";
+      break;
+    case ALERT_MOISTURE_FAULT:
+      msg += "⚠️ <b>Sensor Fault:</b> Soil moisture sensor out-of-range.";
+      break;
+    case ALERT_MOISTURE_RECOVER:
+      msg += "✅ <b>Sensor Recovered:</b> Soil moisture sensor OK.";
+      break;
+    case ALERT_SAFETY_TRIP:
+      msg += "🚨 <b>Safety Trip:</b> Pump ran >5 min, force-stopped.";
+      break;
+    case ALERT_WATERING_START:
+      msg += "💧 <b>Watering Started</b> (" + String(autoMode ? "Auto" : "Manual") + ")";
+      break;
+    case ALERT_WATERING_STOP:
+      msg += "🛑 <b>Watering Stopped</b>";
+      break;
+    case ALERT_WIFI_DISCONNECT:
+      msg += "📡 <b>WiFi Disconnected</b> >5 min.";
+      break;
+    case ALERT_WIFI_RECONNECT:
+      msg += "📡 <b>WiFi Reconnected</b>\nIP: " + WiFi.localIP().toString();
+      break;
+    case ALERT_MQTT_DISCONNECT:
+      msg += "🔌 <b>MQTT Disconnected</b>.";
+      break;
+    case ALERT_BOOT:
+      msg += "🚀 <b>Device Booted</b>\nTime: " + getLocalTimeStr() + "\nIP: " + WiFi.localIP().toString();
+      break;
+    default: return;
+  }
+  sendTelegramMessage(msg);
+}
 
 // ====== Helpers ======
 float readMoisturePercent() {
@@ -908,12 +1134,11 @@ void updateDhtCache() {
   }
 }
 
-// ====== Pump tracking (P3-5) ======
+// ====== Pump tracking ======
 void onPumpTurnedOn() {
   wateringStartTime = millis();
   pumpCycles++;
   pumpStartTime = millis();
-  // Persist immediately so the cycle count survives a crash
   preferences.begin("watering", false);
   preferences.putUInt("pumpCycles", pumpCycles);
   preferences.end();
@@ -927,6 +1152,109 @@ void onPumpTurnedOff() {
     preferences.begin("watering", false);
     preferences.putULong("pumpRuntime", pumpTotalRuntimeSec);
     preferences.end();
+  }
+}
+
+// ====== Access Log ======
+void logAccess(const String& entry) {
+  if (!LittleFS.begin(true)) return;
+  // Truncate if too large
+  if (LittleFS.exists(ACCESS_LOG_FILE)) {
+    File f = LittleFS.open(ACCESS_LOG_FILE, "r");
+    if (f && f.size() > MAX_ACCESS_LOG_SIZE) {
+      f.close();
+      LittleFS.remove(ACCESS_LOG_FILE);
+    } else if (f) {
+      f.close();
+    }
+  }
+  File logFile = LittleFS.open(ACCESS_LOG_FILE, "a");
+  if (!logFile) return;
+  String ts = getIsoTimestamp();
+  logFile.printf("[%s] %s\n", ts.c_str(), entry.c_str());
+  logFile.close();
+}
+
+String getAccessLogTail(int lines) {
+  if (!LittleFS.exists(ACCESS_LOG_FILE)) return "(no log entries)";
+  File f = LittleFS.open(ACCESS_LOG_FILE, "r");
+  if (!f) return "(failed to open log)";
+
+  // Read all lines into a circular buffer
+  String *buffer = new String[lines];
+  int idx = 0, count = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    buffer[idx] = line;
+    idx = (idx + 1) % lines;
+    if (count < lines) count++;
+  }
+  f.close();
+
+  String out;
+  int start = (count < lines) ? 0 : idx;
+  for (int i = 0; i < count; i++) {
+    int j = (start + i) % lines;
+    out += buffer[j] + "\n";
+  }
+  delete[] buffer;
+  return out;
+}
+
+// ====== Rate Limiting ======
+RateLimitEntry* findRateLimit(IPAddress ip) {
+  for (int i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
+    if (rateLimits[i].ip == ip) return &rateLimits[i];
+  }
+  return nullptr;
+}
+
+RateLimitEntry* findFreeRateLimitSlot() {
+  for (int i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
+    if (rateLimits[i].ip == IPAddress(0, 0, 0, 0)) return &rateLimits[i];
+  }
+  // No free slot — evict the oldest expired entry
+  for (int i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
+    if (millis() > rateLimits[i].blockedUntil && rateLimits[i].failCount == 0) {
+      rateLimits[i].ip = IPAddress(0, 0, 0, 0);
+      return &rateLimits[i];
+    }
+  }
+  return nullptr;
+}
+
+bool isRateLimited(IPAddress ip) {
+  RateLimitEntry* entry = findRateLimit(ip);
+  if (!entry) return false;
+  if (millis() < entry->blockedUntil) return true;
+  // Reset if window passed
+  if (millis() - entry->firstFailTime > 60000UL) {
+    entry->failCount = 0;
+    entry->firstFailTime = 0;
+  }
+  return false;
+}
+
+void recordAuthFailure(IPAddress ip) {
+  RateLimitEntry* entry = findRateLimit(ip);
+  if (!entry) {
+    entry = findFreeRateLimitSlot();
+    if (!entry) return;
+    entry->ip = ip;
+    entry->failCount = 0;
+    entry->firstFailTime = millis();
+    entry->blockedUntil = 0;
+  }
+  if (entry->firstFailTime == 0 || millis() - entry->firstFailTime > 60000UL) {
+    entry->firstFailTime = millis();
+    entry->failCount = 0;
+  }
+  entry->failCount++;
+  if (entry->failCount >= 5) {
+    entry->blockedUntil = millis() + 60000UL;  // block 60s
+    logAccess("Rate limit triggered for " + ip.toString() + " (5 failed auth attempts)");
   }
 }
 
@@ -945,23 +1273,27 @@ void loadConfig() {
   MOISTURE_WET      = preferences.getInt("moistWet", 1500);
   wateringStartHour = preferences.getInt("waterStart", 6);
   wateringEndHour   = preferences.getInt("waterEnd", 8);
-  // P3-3: TLS
   validateTlsCert = preferences.getBool("tlsCert", false);
   rootCaPem       = preferences.getString("rootCa", "");
-  // P3-1: MQTT
   mqttEnabled     = preferences.getBool("mqttEn", false);
   mqttBroker      = preferences.getString("mqttBroker", "");
   mqttPort        = preferences.getInt("mqttPort", 1883);
   mqttUser        = preferences.getString("mqttUser", "");
   mqttPass        = preferences.getString("mqttPass", "");
   mqttTopicPrefix = preferences.getString("mqttPrefix", "smartfarm");
-  // P3-2: Telegram
   telegramEnabled  = preferences.getBool("tgEn", false);
   telegramBotToken = preferences.getString("tgToken", "");
   telegramChatId   = preferences.getString("tgChat", "");
-  // P3-5: Pump stats
   pumpCycles         = preferences.getUInt("pumpCycles", 0);
   pumpTotalRuntimeSec= preferences.getULong("pumpRuntime", 0);
+  influxEnabled = preferences.getBool("influxEn", false);
+  influxUrl     = preferences.getString("influxUrl", "");
+  influxOrg     = preferences.getString("influxOrg", "");
+  influxBucket  = preferences.getString("influxBucket", "smartfarm");
+  influxToken   = preferences.getString("influxToken", "");
+  scheduledRebootEnabled = preferences.getBool("schedRebootEn", false);
+  scheduledRebootWeekday = preferences.getInt("schedRebootDay", 1);
+  scheduledRebootHour    = preferences.getInt("schedRebootHour", 3);
   preferences.end();
 }
 
@@ -992,6 +1324,14 @@ void saveConfigToNvs() {
   preferences.putString("tgChat", telegramChatId);
   preferences.putUInt("pumpCycles", pumpCycles);
   preferences.putULong("pumpRuntime", pumpTotalRuntimeSec);
+  preferences.putBool("influxEn", influxEnabled);
+  preferences.putString("influxUrl", influxUrl);
+  preferences.putString("influxOrg", influxOrg);
+  preferences.putString("influxBucket", influxBucket);
+  preferences.putString("influxToken", influxToken);
+  preferences.putBool("schedRebootEn", scheduledRebootEnabled);
+  preferences.putInt("schedRebootDay", scheduledRebootWeekday);
+  preferences.putInt("schedRebootHour", scheduledRebootHour);
   preferences.end();
 }
 
@@ -1000,25 +1340,43 @@ void buildWeatherURL() {
   forecastURL = "https://api.openweathermap.org/data/2.5/forecast?q=" + city + "," + countryCode + "&appid=" + apiKey + "&units=metric";
 }
 
-// ====== Auth + CSRF ======
-bool requireAuth(AsyncWebServerRequest *request) {
+// ====== Auth + CSRF (with rate limiting) ======
+bool requireAuth() {
+  IPAddress ip = server.client().remoteIP();
+  // Check rate limit first
+  if (isRateLimited(ip)) {
+    server.send(429, "application/json", "{\"success\":false,\"error\":\"rate limited\"}");
+    return false;
+  }
   if (authUser.length() == 0 || authPass.length() == 0) return true;
-  if (!request->authenticate(authUser.c_str(), authPass.c_str())) {
-    request->requestAuthentication();
+  if (!server.authenticate(authUser.c_str(), authPass.c_str())) {
+    recordAuthFailure(ip);
+    server.requestAuthentication();
     return false;
   }
   return true;
 }
 
-bool requireCsrf(AsyncWebServerRequest *request) {
-  if (!request->hasHeader("X-Requested-With")) {
-    request->send(403, "application/json", "{\"success\":false,\"error\":\"missing CSRF header\"}");
+bool requireCsrf() {
+  if (!server.hasHeader("X-Requested-With")) {
+    server.send(403, "application/json", "{\"success\":false,\"error\":\"missing CSRF header\"}");
     return false;
   }
   return true;
 }
 
-// ====== P3-3: TLS-aware HTTPS client factory ======
+// ====== Combined auth+log helper ======
+bool requireAuthLogged(const String& action) {
+  bool ok = requireAuth();
+  if (ok) {
+    String method = (server.method() == HTTP_GET) ? "GET" : "POST";
+    String entry = method + " " + server.uri() + " from " + server.client().remoteIP().toString() + " - " + action;
+    logAccess(entry);
+  }
+  return ok;
+}
+
+// ====== TLS-aware HTTPS client factory (for OUTBOUND calls only) ======
 WiFiClientSecure createSecureClient() {
   WiFiClientSecure client;
   if (validateTlsCert && rootCaPem.length() > 0) {
@@ -1029,7 +1387,7 @@ WiFiClientSecure createSecureClient() {
   return client;
 }
 
-// ====== Weather fetch (current conditions) ======
+// ====== Weather + Forecast ======
 void getWeatherData() {
   if (WiFi.status() != WL_CONNECTED || apiKey.length() < 10) return;
   WiFiClientSecure client = createSecureClient();
@@ -1046,14 +1404,12 @@ void getWeatherData() {
       weatherHum  = doc["main"]["humidity"] | NAN;
       weatherDescription = doc["weather"][0]["description"] | String("");
       locationName = doc["name"] | String("");
-      Serial.println(F("[Weather] OK"));
-    } else Serial.println(F("[Weather] JSON error"));
+    }
   } else Serial.printf("[Weather] HTTPS err: %d\n", code);
   http.end();
   lastWeatherUpdate = millis();
 }
 
-// ====== Forecast fetch (rain in next 3 hours) ======
 void getForecastData() {
   if (WiFi.status() != WL_CONNECTED || apiKey.length() < 10) return;
   WiFiClientSecure client = createSecureClient();
@@ -1073,8 +1429,7 @@ void getForecastData() {
       }
       rainNext3h = totalRain;
       rainExpected = (totalRain >= RAIN_THRESHOLD_MM);
-      Serial.printf("[Forecast] Rain 3h: %.2f mm\n", totalRain);
-    } else Serial.println(F("[Forecast] JSON error"));
+    }
   } else Serial.printf("[Forecast] HTTPS err: %d\n", code);
   http.end();
   lastForecastUpdate = millis();
@@ -1089,12 +1444,10 @@ void checkWifiReconnect() {
       wifiWasDisconnected = true;
       lastWifiDisconnect = millis();
     }
-    Serial.println(F("[WiFi] Reconnecting..."));
     WiFi.reconnect();
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 5000) delay(200);
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("[WiFi] Reconnected: %s\n", WiFi.localIP().toString().c_str());
       if (wifiWasDisconnected) {
         wifiWasDisconnected = false;
         sendAlert(ALERT_WIFI_RECONNECT);
@@ -1102,7 +1455,6 @@ void checkWifiReconnect() {
     }
   } else {
     if (wifiWasDisconnected && (millis() - lastWifiDisconnect > 300000)) {
-      // disconnected > 5 min and still not back
       sendAlert(ALERT_WIFI_DISCONNECT);
     }
   }
@@ -1118,6 +1470,63 @@ bool isWithinWateringWindow() {
   } else {
     return (h >= wateringStartHour || h < wateringEndHour);
   }
+}
+
+// ====== Scheduled Reboot Check ======
+void checkScheduledReboot() {
+  if (!scheduledRebootEnabled) return;
+  // Run this check at most once per minute
+  unsigned long nowMin = millis() / 60000UL;
+  if (nowMin == lastRebootCheckMinute) return;
+  lastRebootCheckMinute = nowMin;
+
+  int wd = getLocalWeekday();
+  int hr = getLocalHour();
+  if (wd < 0 || hr < 0) return;  // NTP not synced
+
+  if (wd == scheduledRebootWeekday && hr == scheduledRebootHour) {
+    if (!lastScheduledRebootCheck) {
+      lastScheduledRebootCheck = true;
+      logAccess("Scheduled reboot triggered");
+      sendAlert(ALERT_BOOT);  // send pre-reboot alert
+      delay(500);
+      ESP.restart();
+    }
+  } else {
+    lastScheduledRebootCheck = false;
+  }
+}
+
+// ====== Status LED ======
+void updateStatusLed() {
+  if (millis() - lastLedUpdate < ledBlinkInterval) return;
+  lastLedUpdate = millis();
+  ledState = !ledState;
+  digitalWrite(STATUS_LED_PIN, ledState);
+
+  // Determine blink interval based on system state
+  if (dhtFault || moistureFault) {
+    ledBlinkInterval = 100;   // fast blink: sensor fault
+  } else if (safetyTrip) {
+    ledBlinkInterval = 250;   // medium-fast: safety trip
+  } else if (WiFi.status() != WL_CONNECTED) {
+    ledBlinkInterval = 200;   // fast: WiFi issue
+  } else if (mqttEnabled && !mqtt.connected()) {
+    ledBlinkInterval = 500;   // medium: MQTT issue
+  } else if (watering) {
+    ledBlinkInterval = 1000;  // slow: watering
+  } else {
+    ledBlinkInterval = 3000;  // very slow: idle/OK
+  }
+}
+
+String getLedStateStr() {
+  if (dhtFault || moistureFault) return "Fault (fast blink)";
+  if (safetyTrip) return "Safety trip";
+  if (WiFi.status() != WL_CONNECTED) return "WiFi issue";
+  if (mqttEnabled && !mqtt.connected()) return "MQTT issue";
+  if (watering) return "Watering";
+  return "OK (slow blink)";
 }
 
 // ====== LittleFS history logging ======
@@ -1188,7 +1597,6 @@ String getHistoryJson(int hours) {
     if (c4 < 0) { moistStr = rest; waterStr = "0"; }
     else { moistStr = rest.substring(0, c4); waterStr = rest.substring(c4 + 1); }
 
-    // Filter by epoch timestamps; ISO timestamps (post-2020) all pass
     if (ts.length() > 0 && isdigit(ts.charAt(0)) && ts.length() > 10) {
       time_t t = ts.toInt();
       if (t < cutoff) continue;
@@ -1206,14 +1614,15 @@ String getHistoryJson(int hours) {
     else            out += "\"hum\":" + String(hum, 1) + ",";
     if (moist < 0)  out += "\"moist\":null,";
     else            out += "\"moist\":" + String(moist, 1) + ",";
-    out += "\"water\":" + (waterStr.toInt() ? "true" : "false") + "}";
+    out += "\"water\":";
+    out += (waterStr.toInt() ? "true" : "false");
+    out += "}";
   }
   out += "]";
   f.close();
   return out;
 }
 
-// CSV export (P3-7)
 String getHistoryCsv() {
   if (!LittleFS.exists(LOG_FILE)) return "timestamp,temperature,humidity,moisture,watering\n";
   File f = LittleFS.open(LOG_FILE, "r");
@@ -1226,13 +1635,13 @@ String getHistoryCsv() {
   return out;
 }
 
-// ====== P3-1: MQTT ======
+// ====== MQTT ======
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String topicStr(topic);
   String payloadStr;
   for (unsigned int i = 0; i < length; i++) payloadStr += (char)payload[i];
   payloadStr.trim();
-  Serial.printf("[MQTT] Rx: %s = %s\n", topicStr.c_str(), payloadStr.c_str());
+  logAccess("MQTT cmd: " + topicStr + " = " + payloadStr);
 
   String cmdTopic = mqttTopicPrefix + "/cmd/";
   if (topicStr == cmdTopic + "water_on") {
@@ -1262,7 +1671,6 @@ void setupMqtt() {
   mqtt.setServer(mqttBroker.c_str(), mqttPort);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(MQTT_MAX_PACKET);
-  Serial.printf("[MQTT] Configured: %s:%d\n", mqttBroker.c_str(), mqttPort);
 }
 
 void reconnectMqtt() {
@@ -1271,7 +1679,6 @@ void reconnectMqtt() {
   lastMqttReconnect = millis();
   if (mqtt.connected()) return;
 
-  Serial.println(F("[MQTT] Connecting..."));
   String clientId = "SmartAgri-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   bool connected;
   if (mqttUser.length() > 0) {
@@ -1282,17 +1689,12 @@ void reconnectMqtt() {
 
   if (connected) {
     mqttConnectedNow = true;
-    Serial.println(F("[MQTT] Connected"));
-    // Subscribe to command topics
     String sub = mqttTopicPrefix + "/cmd/#";
     mqtt.subscribe(sub.c_str());
-    // Announce we're online
     String topic = mqttTopicPrefix + "/status";
     mqtt.publish(topic.c_str(), "online", true);
-    sendAlert(ALERT_BOOT);
   } else {
     mqttConnectedNow = false;
-    Serial.printf("[MQTT] Connect failed, state=%d\n", mqtt.state());
   }
 }
 
@@ -1308,10 +1710,16 @@ void publishMqttSensorData() {
   if (m >= 0) mqtt.publish((base + "moisture").c_str(), String(m, 1).c_str(), true);
   mqtt.publish((base + "relay").c_str(), watering ? "ON" : "OFF", true);
 
-  // Full status JSON
   DynamicJsonDocument doc(512);
-  doc["temperature"] = isnan(cachedTemp) ? nullptr : cachedTemp;
-  doc["humidity"]    = isnan(cachedHum)  ? nullptr : cachedHum;
+  if (isnan(cachedTemp))
+    doc["temperature"] = 0;
+  else
+    doc["temperature"] = cachedTemp;
+
+  if (isnan(cachedHum))
+    doc["humidity"] = 0;
+  else
+    doc["humidity"] = cachedHum;
   doc["moisture"]    = m;
   doc["watering"]    = watering;
   doc["auto_mode"]   = autoMode;
@@ -1324,7 +1732,7 @@ void publishMqttSensorData() {
   mqtt.publish((mqttTopicPrefix + "/status").c_str(), statusJson.c_str(), true);
 }
 
-// ====== P3-2: Telegram alerts ======
+// ====== Telegram alerts ======
 bool sendTelegramMessage(const String& text) {
   if (!telegramEnabled || telegramBotToken.length() < 10 || telegramChatId.length() == 0) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
@@ -1345,74 +1753,70 @@ bool sendTelegramMessage(const String& text) {
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   http.end();
+  return code == 200;
+}
 
-  if (code == 200) {
-    Serial.println(F("[Telegram] Sent OK"));
+// ====== InfluxDB push ======
+bool pushToInflux() {
+  if (!influxEnabled || influxUrl.length() == 0 || influxToken.length() == 0) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (millis() - lastInfluxWrite < INFLUX_INTERVAL_MS) return false;
+  lastInfluxWrite = millis();
+
+  // Build line protocol payload
+  // Format: measurement,tag=value field=value timestamp
+  String payload;
+  payload += "sensor,device=smartfarm ";
+  if (!isnan(cachedTemp)) payload += "temperature=" + String(cachedTemp, 2) + ",";
+  if (!isnan(cachedHum))  payload += "humidity=" + String(cachedHum, 2) + ",";
+  float m = moistureFault ? -1.0f : readMoisturePercent();
+  if (m >= 0) payload += "moisture=" + String(m, 2) + ",";
+  payload += "watering=" + String(watering ? "1i" : "0i") + ",";
+  payload += "auto_mode=" + String(autoMode ? "1i" : "0i");
+  // We always end with auto_mode, no trailing comma
+
+  // Build URL
+  String url = influxUrl;
+  if (!url.endsWith("/")) url += "/";
+  url += "api/v2/write?org=" + influxOrg + "&bucket=" + influxBucket + "&precision=s";
+
+  WiFiClientSecure client = createSecureClient();
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.begin(client, url);
+  http.addHeader("Authorization", "Token " + influxToken);
+  http.addHeader("Content-Type", "text/plain; charset=utf-8");
+
+  int code = http.POST(payload);
+  http.end();
+
+  if (code == 204) {
+    Serial.println(F("[InfluxDB] Pushed OK"));
     return true;
   } else {
-    Serial.printf("[Telegram] Send failed: %d\n", code);
+    Serial.printf("[InfluxDB] Push failed: %d\n", code);
     return false;
   }
 }
 
-void sendAlert(AlertType type) {
-  if (!telegramEnabled) return;
-  // Cooldown: don't send same alert type within 5 minutes
-  if (millis() - lastTelegramAlert[type] < TELEGRAM_COOLDOWN_MS) return;
-  lastTelegramAlert[type] = millis();
+bool pushTestToInflux() {
+  if (!influxEnabled || influxUrl.length() == 0 || influxToken.length() == 0) return false;
 
-  String msg = "🌱 <b>Smart Agricultural System</b>\n";
-  switch (type) {
-    case ALERT_DHT_FAULT:
-      msg += "⚠️ <b>Sensor Fault:</b> DHT11 not responding (4+ consecutive NaN reads).\n";
-      msg += "Check wiring at GPIO " + String(DHTPIN) + ".";
-      break;
-    case ALERT_DHT_RECOVER:
-      msg += "✅ <b>Sensor Recovered:</b> DHT11 is reading normally again.";
-      break;
-    case ALERT_MOISTURE_FAULT:
-      msg += "⚠️ <b>Sensor Fault:</b> Soil moisture sensor reads out-of-range (disconnected or shorted).\n";
-      msg += "Check wiring at GPIO " + String(MOISTURE_PIN) + ".";
-      break;
-    case ALERT_MOISTURE_RECOVER:
-      msg += "✅ <b>Sensor Recovered:</b> Soil moisture sensor is reading normally again.";
-      break;
-    case ALERT_SAFETY_TRIP:
-      msg += "🚨 <b>Safety Trip:</b> Pump ran for over 5 minutes and was force-stopped.\n";
-      msg += "Auto-mode disabled. Check sensor and re-enable manually.";
-      break;
-    case ALERT_WATERING_START:
-      msg += "💧 <b>Watering Started</b>\n";
-      msg += "Mode: " + String(autoMode ? "Auto" : "Manual") + "\n";
-      if (!isnan(cachedTemp)) msg += "Temp: " + String(cachedTemp, 1) + "°C\n";
-      if (!moistureFault) msg += "Moisture: " + String(readMoisturePercent(), 1) + "%";
-      break;
-    case ALERT_WATERING_STOP:
-      msg += "🛑 <b>Watering Stopped</b>";
-      if (pumpStartTime > 0) {
-        unsigned long dur = (millis() - pumpStartTime) / 1000;
-        msg += "\nDuration: " + String(dur) + "s";
-      }
-      break;
-    case ALERT_WIFI_DISCONNECT:
-      msg += "📡 <b>WiFi Disconnected</b> for over 5 minutes.\nDevice is offline.";
-      break;
-    case ALERT_WIFI_RECONNECT:
-      msg += "📡 <b>WiFi Reconnected</b>\nIP: " + WiFi.localIP().toString();
-      break;
-    case ALERT_MQTT_DISCONNECT:
-      msg += "🔌 <b>MQTT Disconnected</b> from broker.";
-      break;
-    case ALERT_BOOT:
-      msg += "🚀 <b>Device Booted</b>\n";
-      msg += "Time: " + getLocalTimeStr() + "\n";
-      msg += "IP: " + WiFi.localIP().toString() + "\n";
-      msg += "Firmware: P3 release";
-      break;
-    default:
-      return;
-  }
-  sendTelegramMessage(msg);
+  String payload = "test,device=smartfarm value=1i";
+  String url = influxUrl;
+  if (!url.endsWith("/")) url += "/";
+  url += "api/v2/write?org=" + influxOrg + "&bucket=" + influxBucket + "&precision=s";
+
+  WiFiClientSecure client = createSecureClient();
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.begin(client, url);
+  http.addHeader("Authorization", "Token " + influxToken);
+  http.addHeader("Content-Type", "text/plain; charset=utf-8");
+
+  int code = http.POST(payload);
+  http.end();
+  return code == 204;
 }
 
 // ====== Setup ======
@@ -1424,13 +1828,23 @@ void setup() {
   dht.begin();
   pinMode(MOISTURE_PIN, INPUT);
   pinMode(RELAY_PIN, OUTPUT);
+  pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(STATUS_LED_PIN, LOW);
 
   analogReadResolution(12);
   analogSetPinAttenuation(MOISTURE_PIN, ADC_11db);
 
   loadConfig();
   setupLittleFS();
+
+  // Init rate limit array
+  for (int i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
+    rateLimits[i].ip = IPAddress(0, 0, 0, 0);
+    rateLimits[i].failCount = 0;
+    rateLimits[i].firstFailTime = 0;
+    rateLimits[i].blockedUntil = 0;
+  }
 
   // WiFiManager captive portal
   WiFi.mode(WIFI_STA);
@@ -1452,7 +1866,6 @@ void setup() {
   Serial.println(F("[NTP] Configuring time..."));
   configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
 
-  // Wait briefly for first NTP sync (non-blocking after this)
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 5000)) {
     lastBootTimeStr = getLocalTimeStr();
@@ -1466,18 +1879,55 @@ void setup() {
   getForecastData();
   updateDhtCache();
 
-  // P3-1: Initialize MQTT
   mqtt.setKeepAlive(60);
   setupMqtt();
 
-  // ====== Routes ======
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    request->send_P(200, "text/html", index_html);
+  logAccess("Device booted");
+    // ====== Lightweight Built-in OTA ======
+  server.on("/update", HTTP_GET, []() {
+    if (!requireAuth()) return;
+    String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body{font-family:Arial,sans-serif;background:#f5f5f5;padding:20px;text-align:center;}";
+    html += ".btn{padding:10px 20px;background:#3498db;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:16px;}";
+    html += "</style></head><body>";
+    html += "<h2>ESP32-S3 Firmware Update</h2>";
+    html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+    html += "<input type='file' name='update' accept='.bin' style='margin:10px;'>";
+    html += "<br><input type='submit' value='Upload & Flash' class='btn'></form>";
+    html += "<p>Only upload .bin files compiled for ESP32-S3.</p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
   });
 
-  server.on("/sensor-data", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/update", HTTP_POST, []() {
+    if (!requireAuth()) return;
+    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+    delay(1000);
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("Update: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.printError(Serial); }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) { Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize); } 
+      else { Update.printError(Serial); }
+    }
+  });
+
+  server.begin();
+  Serial.println(F("[HTTP] server started on port 80"));
+
+  // ====== Routes ======
+  server.on("/", HTTP_GET, [](){
+    if (!requireAuth()) return;
+    server.send_P(200, "text/html", index_html);
+  });
+
+  server.on("/sensor-data", HTTP_GET, [](){
+    if (!requireAuth()) return;
     int raw = readMoistureRaw();
     float m = readMoisturePercent();
     DynamicJsonDocument doc(256);
@@ -1486,11 +1936,11 @@ void setup() {
     doc["moisture"] = m;
     doc["raw_moisture"] = raw;
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  server.on("/system-status", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/system-status", HTTP_GET, [](){
+    if (!requireAuth()) return;
     DynamicJsonDocument doc(256);
     doc["status"] = (autoMode ? "Auto" : "Manual");
     doc["relay"]  = watering;
@@ -1498,16 +1948,16 @@ void setup() {
     doc["dht_fault"] = dhtFault;
     doc["moisture_fault"] = moistureFault;
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  server.on("/control", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    if (!requireCsrf(request)) return;
-    String body = request->arg("plain");
+  server.on("/control", HTTP_POST, [](){
+    if (!requireAuthLogged("control")) return;
+    if (!requireCsrf()) return;
+    String body = server.arg("plain");
     DynamicJsonDocument doc(256);
     if (deserializeJson(doc, body)) {
-      request->send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
+      server.send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
       return;
     }
     String command = doc["command"] | "";
@@ -1517,13 +1967,13 @@ void setup() {
       digitalWrite(RELAY_PIN, LOW);
       saveConfigToNvs();
       sendAlert(ALERT_WATERING_START);
-      request->send(200, "application/json", "{\"success\":true}");
+      server.send(200, "application/json", "{\"success\":true}");
     } else if (command == "water_off") {
       if (watering) { onPumpTurnedOff(); sendAlert(ALERT_WATERING_STOP); }
       watering = false; autoMode = false; safetyTrip = false;
       digitalWrite(RELAY_PIN, HIGH);
       saveConfigToNvs();
-      request->send(200, "application/json", "{\"success\":true}");
+      server.send(200, "application/json", "{\"success\":true}");
     } else if (command == "auto_mode") {
       autoMode = !autoMode;
       safetyTrip = false;
@@ -1532,30 +1982,33 @@ void setup() {
       DynamicJsonDocument res(128);
       res["success"] = true; res["auto_mode"] = autoMode;
       String out; serializeJson(res, out);
-      request->send(200, "application/json", out);
+      server.send(200, "application/json", out);
     } else {
-      request->send(400, "application/json", "{\"success\":false,\"error\":\"unknown command\"}");
+      server.send(400, "application/json", "{\"success\":false,\"error\":\"unknown command\"}");
     }
   });
 
-  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/settings", HTTP_GET, [](){
+    if (!requireAuth()) return;
     DynamicJsonDocument doc(256);
     doc["moisture_threshold"] = moistureThreshold;
     doc["humidity_threshold"] = humidityThreshold;
     doc["watering_start_hour"] = wateringStartHour;
     doc["watering_end_hour"] = wateringEndHour;
+    doc["scheduled_reboot_enabled"] = scheduledRebootEnabled;
+    doc["scheduled_reboot_weekday"] = scheduledRebootWeekday;
+    doc["scheduled_reboot_hour"] = scheduledRebootHour;
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  server.on("/settings", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    if (!requireCsrf(request)) return;
-    String body = request->arg("plain");
+  server.on("/settings", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
+    String body = server.arg("plain");
     DynamicJsonDocument doc(256);
     if (deserializeJson(doc, body)) {
-      request->send(400, "application/json", "{\"success\":false}");
+      server.send(400, "application/json", "{\"success\":false}");
       return;
     }
     float m = doc["moisture_threshold"].as<float>();
@@ -1566,13 +2019,18 @@ void setup() {
       wateringStartHour = constrain(doc["watering_start_hour"].as<int>(), 0, 23);
       wateringEndHour   = constrain(doc["watering_end_hour"].as<int>(), 0, 23);
     }
+    if (doc.containsKey("scheduled_reboot_enabled")) {
+      scheduledRebootEnabled = doc["scheduled_reboot_enabled"].as<bool>();
+      scheduledRebootWeekday = constrain(doc["scheduled_reboot_weekday"].as<int>(), 0, 6);
+      scheduledRebootHour    = constrain(doc["scheduled_reboot_hour"].as<int>(), 0, 23);
+    }
     saveConfigToNvs();
-    request->send(200, "application/json", "{\"success\":true}");
+    server.send(200, "application/json", "{\"success\":true}");
   });
 
-  server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    DynamicJsonDocument doc(1024);
+  server.on("/config", HTTP_GET, [](){
+    if (!requireAuth()) return;
+    DynamicJsonDocument doc(2048);
     doc["api_key"]    = apiKey;
     doc["city"]       = city;
     doc["country"]    = countryCode;
@@ -1588,160 +2046,123 @@ void setup() {
     doc["telegram_enabled"]    = telegramEnabled;
     doc["telegram_chat_id"]    = telegramChatId;
     doc["telegram_bot_token"]  = telegramBotToken;
+    doc["influx_enabled"]  = influxEnabled;
+    doc["influx_url"]      = influxUrl;
+    doc["influx_org"]      = influxOrg;
+    doc["influx_bucket"]   = influxBucket;
+    doc["influx_token"]    = influxToken;
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    if (!requireCsrf(request)) return;
-    String body = request->arg("plain");
+  server.on("/config", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
+    String body = server.arg("plain");
     DynamicJsonDocument doc(4096);
     if (deserializeJson(doc, body)) {
-      request->send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
+      server.send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
       return;
     }
     bool urlNeedsRebuild = false;
     bool mqttChanged = false;
-    bool telegramChanged = false;
-    bool tlsChanged = false;
+    bool influxChanged = false;
 
-    if (doc.containsKey("api_key")) {
-      String v = doc["api_key"].as<String>();
-      if (v != apiKey) { apiKey = v; urlNeedsRebuild = true; }
-    }
-    if (doc.containsKey("city")) {
-      String v = doc["city"].as<String>();
-      if (v != city) { city = v; urlNeedsRebuild = true; }
-    }
-    if (doc.containsKey("country")) {
-      String v = doc["country"].as<String>(); v.toUpperCase();
-      if (v != countryCode) { countryCode = v; urlNeedsRebuild = true; }
-    }
-    if (doc.containsKey("auth_user")) {
-      String v = doc["auth_user"].as<String>();
-      if (v.length() > 0 && v != authUser) authUser = v;
-    }
-    if (doc.containsKey("auth_pass")) {
-      String v = doc["auth_pass"].as<String>();
-      if (v.length() > 0) authPass = v;
-    }
-    if (doc.containsKey("validate_tls_cert")) {
-      bool v = doc["validate_tls_cert"].as<bool>();
-      if (v != validateTlsCert) { validateTlsCert = v; tlsChanged = true; }
-    }
-    if (doc.containsKey("root_ca")) {
-      String v = doc["root_ca"].as<String>();
-      if (v != rootCaPem) { rootCaPem = v; tlsChanged = true; }
-    }
-    // MQTT
+    if (doc.containsKey("api_key")) { String v = doc["api_key"].as<String>(); if (v != apiKey) { apiKey = v; urlNeedsRebuild = true; } }
+    if (doc.containsKey("city")) { String v = doc["city"].as<String>(); if (v != city) { city = v; urlNeedsRebuild = true; } }
+    if (doc.containsKey("country")) { String v = doc["country"].as<String>(); v.toUpperCase(); if (v != countryCode) { countryCode = v; urlNeedsRebuild = true; } }
+    if (doc.containsKey("auth_user")) { String v = doc["auth_user"].as<String>(); if (v.length() > 0 && v != authUser) authUser = v; }
+    if (doc.containsKey("auth_pass")) { String v = doc["auth_pass"].as<String>(); if (v.length() > 0) authPass = v; }
+    if (doc.containsKey("validate_tls_cert")) { validateTlsCert = doc["validate_tls_cert"].as<bool>(); }
+    if (doc.containsKey("root_ca")) { rootCaPem = doc["root_ca"].as<String>(); }
     if (doc.containsKey("mqtt_enabled"))    { mqttEnabled    = doc["mqtt_enabled"].as<bool>();    mqttChanged = true; }
     if (doc.containsKey("mqtt_broker"))     { mqttBroker     = doc["mqtt_broker"].as<String>();  mqttChanged = true; }
     if (doc.containsKey("mqtt_port"))       { mqttPort       = doc["mqtt_port"].as<int>();        mqttChanged = true; }
     if (doc.containsKey("mqtt_prefix"))     { mqttTopicPrefix= doc["mqtt_prefix"].as<String>();   mqttChanged = true; }
     if (doc.containsKey("mqtt_user"))       { mqttUser       = doc["mqtt_user"].as<String>();     mqttChanged = true; }
-    if (doc.containsKey("mqtt_pass")) {
-      String v = doc["mqtt_pass"].as<String>();
-      if (v.length() > 0) { mqttPass = v; mqttChanged = true; }
-    }
-    // Telegram
-    if (doc.containsKey("telegram_enabled"))   { telegramEnabled   = doc["telegram_enabled"].as<bool>();     telegramChanged = true; }
-    if (doc.containsKey("telegram_chat_id"))   { telegramChatId    = doc["telegram_chat_id"].as<String>();   telegramChanged = true; }
-    if (doc.containsKey("telegram_bot_token")) { telegramBotToken  = doc["telegram_bot_token"].as<String>(); telegramChanged = true; }
+    if (doc.containsKey("mqtt_pass")) { String v = doc["mqtt_pass"].as<String>(); if (v.length() > 0) { mqttPass = v; mqttChanged = true; } }
+    if (doc.containsKey("telegram_enabled"))   { telegramEnabled   = doc["telegram_enabled"].as<bool>(); }
+    if (doc.containsKey("telegram_chat_id"))   { telegramChatId    = doc["telegram_chat_id"].as<String>(); }
+    if (doc.containsKey("telegram_bot_token")) { telegramBotToken  = doc["telegram_bot_token"].as<String>(); }
+    if (doc.containsKey("influx_enabled"))  { influxEnabled  = doc["influx_enabled"].as<bool>();   influxChanged = true; }
+    if (doc.containsKey("influx_url"))      { influxUrl      = doc["influx_url"].as<String>();     influxChanged = true; }
+    if (doc.containsKey("influx_org"))      { influxOrg      = doc["influx_org"].as<String>();     influxChanged = true; }
+    if (doc.containsKey("influx_bucket"))   { influxBucket   = doc["influx_bucket"].as<String>(); influxChanged = true; }
+    if (doc.containsKey("influx_token"))    { influxToken    = doc["influx_token"].as<String>();  influxChanged = true; }
 
-    if (urlNeedsRebuild) {
-      buildWeatherURL();
-      lastWeatherUpdate = 0;
-      lastForecastUpdate = 0;
-    }
+    if (urlNeedsRebuild) { buildWeatherURL(); lastWeatherUpdate = 0; lastForecastUpdate = 0; }
     saveConfigToNvs();
     if (mqttChanged) setupMqtt();
-    if (tlsChanged) Serial.println(F("[TLS] Cert validation settings updated"));
 
     DynamicJsonDocument res(128);
     res["success"] = true;
     res["rebuild_url"] = urlNeedsRebuild;
-    if (mqttChanged) res["mqtt_reinit"] = true;
-    if (telegramChanged) res["telegram_changed"] = true;
+    if (influxChanged) res["influx_changed"] = true;
     String out; serializeJson(res, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  // Calibration endpoints
-  server.on("/calibrate", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/calibrate", HTTP_GET, [](){
+    if (!requireAuth()) return;
     DynamicJsonDocument doc(128);
     doc["dry"] = MOISTURE_DRY;
     doc["wet"] = MOISTURE_WET;
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  server.on("/calibrate", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    if (!requireCsrf(request)) return;
-    String body = request->arg("plain");
+  server.on("/calibrate", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
+    String body = server.arg("plain");
     DynamicJsonDocument doc(256);
     if (deserializeJson(doc, body)) {
-      request->send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
+      server.send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
       return;
     }
     String action = doc["action"] | "";
     int raw = readMoistureRaw();
     DynamicJsonDocument res(128);
-    if (action == "set_dry") {
-      MOISTURE_DRY = raw;
-      saveConfigToNvs();
-      res["success"] = true; res["value"] = raw;
-    } else if (action == "set_wet") {
-      MOISTURE_WET = raw;
-      saveConfigToNvs();
-      res["success"] = true; res["value"] = raw;
-    } else {
-      request->send(400, "application/json", "{\"success\":false,\"error\":\"unknown action\"}");
-      return;
-    }
+    if (action == "set_dry") { MOISTURE_DRY = raw; saveConfigToNvs(); res["success"] = true; res["value"] = raw; }
+    else if (action == "set_wet") { MOISTURE_WET = raw; saveConfigToNvs(); res["success"] = true; res["value"] = raw; }
+    else { server.send(400, "application/json", "{\"success\":false,\"error\":\"unknown action\"}"); return; }
     String out; serializeJson(res, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  // History endpoints
-  server.on("/history", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/history", HTTP_GET, [](){
+    if (!requireAuth()) return;
     int hours = 24;
-    if (request->hasParam("hours")) {
-      hours = request->getParam("hours")->value().toInt();
+    if (server.hasArg("hours")) {
+      hours = server.arg("hours").toInt();
       if (hours < 1) hours = 24;
       if (hours > 168) hours = 168;
     }
     String json = getHistoryJson(hours);
-    request->send(200, "application/json", json);
+    server.send(200, "application/json", json);
   });
 
-  // P3-7: CSV export
-  server.on("/export.csv", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/export.csv", HTTP_GET, [](){
+    if (!requireAuth()) return;
     String csv = getHistoryCsv();
-    AsyncWebServerResponse *response = request->beginResponse(200, "text/csv", csv);
     String filename = "smartfarm_log_" + getIsoTimestamp() + ".csv";
     filename.replace(":", "");
     filename.replace("-", "");
-    response->addHeader("Content-Disposition", "attachment; filename=" + filename);
-    request->send(response);
+    server.sendHeader("Content-Disposition", "attachment; filename=" + filename);
+    server.send(200, "text/csv", csv);
   });
 
-  server.on("/time", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/time", HTTP_GET, [](){
+    if (!requireAuth()) return;
     DynamicJsonDocument doc(128);
     doc["time"] = getLocalTimeStr();
     doc["hour"] = getLocalHour();
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  // P3-4: Diagnostics endpoint
-  server.on("/diagnostics", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/diagnostics", HTTP_GET, [](){
+    if (!requireAuth()) return;
     DynamicJsonDocument doc(512);
     doc["uptime"] = (long)((millis() - bootTime) / 1000);
     doc["free_heap"] = (long)ESP.getFreeHeap();
@@ -1752,33 +2173,50 @@ void setup() {
     doc["fs_total"] = (long)LittleFS.totalBytes();
     doc["mqtt_enabled"]   = mqttEnabled;
     doc["mqtt_connected"] = mqtt.connected();
+    doc["influx_enabled"] = influxEnabled;
     doc["pump_cycles"]    = pumpCycles;
     doc["pump_runtime_sec"] = (long)pumpTotalRuntimeSec;
+    doc["led_state"]      = getLedStateStr();
     doc["last_boot"]      = lastBootTimeStr;
+    doc["scheduled_reboot_enabled"] = scheduledRebootEnabled;
+    doc["scheduled_reboot_weekday"] = scheduledRebootWeekday;
+    doc["scheduled_reboot_hour"]    = scheduledRebootHour;
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  // P3-2: Telegram test endpoint
-  server.on("/telegram/test", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    if (!requireCsrf(request)) return;
+  server.on("/telegram/test", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
     DynamicJsonDocument res(128);
     if (!telegramEnabled) {
-      res["success"] = false;
-      res["error"] = "Telegram not enabled";
+      res["success"] = false; res["error"] = "Telegram not enabled";
     } else {
-      bool ok = sendTelegramMessage("🧪 <b>Test Alert</b>\nThis is a test message from your Smart Agricultural System.\nIf you see this, Telegram alerts are working correctly.");
+      bool ok = sendTelegramMessage("🧪 <b>Test Alert</b>\nIf you see this, Telegram alerts are working.");
       res["success"] = ok;
       if (!ok) res["error"] = "Send failed - check bot token and chat ID";
     }
     String out; serializeJson(res, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  // P3-6: Backup / Restore
-  server.on("/backup", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/influx/test", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
+    DynamicJsonDocument res(128);
+    if (!influxEnabled) {
+      res["success"] = false; res["error"] = "InfluxDB not enabled";
+    } else {
+      bool ok = pushTestToInflux();
+      res["success"] = ok;
+      if (!ok) res["error"] = "Push failed - check URL, org, bucket, and token";
+    }
+    String out; serializeJson(res, out);
+    server.send(200, "application/json", out);
+  });
+
+  server.on("/backup", HTTP_GET, [](){
+    if (!requireAuth()) return;
     DynamicJsonDocument doc(2048);
     doc["api_key"]    = apiKey;
     doc["city"]       = city;
@@ -1799,19 +2237,27 @@ void setup() {
     doc["telegram_enabled"]    = telegramEnabled;
     doc["telegram_chat_id"]    = telegramChatId;
     doc["telegram_bot_token"]  = telegramBotToken;
+    doc["influx_enabled"]  = influxEnabled;
+    doc["influx_url"]      = influxUrl;
+    doc["influx_org"]      = influxOrg;
+    doc["influx_bucket"]   = influxBucket;
+    doc["influx_token"]    = influxToken;
     doc["validate_tls_cert"]   = validateTlsCert;
+    doc["scheduled_reboot_enabled"] = scheduledRebootEnabled;
+    doc["scheduled_reboot_weekday"] = scheduledRebootWeekday;
+    doc["scheduled_reboot_hour"]    = scheduledRebootHour;
     doc["backup_time"] = getIsoTimestamp();
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  server.on("/restore", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    if (!requireCsrf(request)) return;
-    String body = request->arg("plain");
+  server.on("/restore", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
+    String body = server.arg("plain");
     DynamicJsonDocument doc(4096);
     if (deserializeJson(doc, body)) {
-      request->send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
+      server.send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}");
       return;
     }
     if (doc.containsKey("api_key"))    apiKey = doc["api_key"].as<String>();
@@ -1833,39 +2279,81 @@ void setup() {
     if (doc.containsKey("telegram_enabled"))    telegramEnabled   = doc["telegram_enabled"].as<bool>();
     if (doc.containsKey("telegram_chat_id"))    telegramChatId    = doc["telegram_chat_id"].as<String>();
     if (doc.containsKey("telegram_bot_token"))  telegramBotToken  = doc["telegram_bot_token"].as<String>();
+    if (doc.containsKey("influx_enabled"))  influxEnabled  = doc["influx_enabled"].as<bool>();
+    if (doc.containsKey("influx_url"))      influxUrl      = doc["influx_url"].as<String>();
+    if (doc.containsKey("influx_org"))      influxOrg      = doc["influx_org"].as<String>();
+    if (doc.containsKey("influx_bucket"))   influxBucket   = doc["influx_bucket"].as<String>();
+    if (doc.containsKey("influx_token"))    influxToken    = doc["influx_token"].as<String>();
     if (doc.containsKey("validate_tls_cert"))   validateTlsCert   = doc["validate_tls_cert"].as<bool>();
+    if (doc.containsKey("scheduled_reboot_enabled")) scheduledRebootEnabled = doc["scheduled_reboot_enabled"].as<bool>();
+    if (doc.containsKey("scheduled_reboot_weekday")) scheduledRebootWeekday = doc["scheduled_reboot_weekday"].as<int>();
+    if (doc.containsKey("scheduled_reboot_hour"))    scheduledRebootHour    = doc["scheduled_reboot_hour"].as<int>();
     saveConfigToNvs();
     buildWeatherURL();
     setupMqtt();
-    request->send(200, "application/json", "{\"success\":true}");
+    server.send(200, "application/json", "{\"success\":true}");
     delay(500);
     ESP.restart();
   });
 
-  // Reboot endpoint
-  server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    if (!requireCsrf(request)) return;
-    request->send(200, "application/json", "{\"success\":true}");
+  // Access log endpoints
+  server.on("/logs", HTTP_GET, [](){
+    if (!requireAuth()) return;
+    String log = getAccessLogTail(50);
+    server.send(200, "text/plain", log);
+  });
+
+  server.on("/logs/clear", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
+    LittleFS.remove(ACCESS_LOG_FILE);
+    logAccess("Access log cleared");
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+
+  // Factory Reset
+  server.on("/factory-reset", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
+    logAccess("FACTORY RESET triggered by " + server.client().remoteIP().toString());
+    // Wipe NVS
+    preferences.begin("watering", false);
+    preferences.clear();
+    preferences.end();
+    // Wipe LittleFS
+    LittleFS.format();
+    // Wipe WiFi config
+    WiFiManager wm;
+    wm.resetSettings();
+    server.send(200, "application/json", "{\"success\":true}");
+    delay(1000);
+    ESP.restart();
+  });
+
+  server.on("/reboot", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
+    logAccess("Reboot triggered");
+    server.send(200, "application/json", "{\"success\":true}");
     delay(500);
     ESP.restart();
   });
 
-  server.on("/reset-wifi", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
-    if (!requireCsrf(request)) return;
+  server.on("/reset-wifi", HTTP_POST, [](){
+    if (!requireAuth()) return;
+    if (!requireCsrf()) return;
     WiFiManager wm;
     wm.resetSettings();
     DynamicJsonDocument res(64);
     res["success"] = true;
     String out; serializeJson(res, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
     delay(500);
     ESP.restart();
   });
 
-  server.on("/weather", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (!requireAuth(request)) return;
+  server.on("/weather", HTTP_GET, [](){
+    if (!requireAuth()) return;
     if (millis() - lastWeatherUpdate > WEATHER_INTERVAL_MS) getWeatherData();
     if (millis() - lastForecastUpdate > FORECAST_INTERVAL_MS) getForecastData();
     DynamicJsonDocument doc(256);
@@ -1876,27 +2364,26 @@ void setup() {
     doc["rain_3h"] = rainNext3h;
     doc["rain_expected"] = rainExpected;
     String out; serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    server.send(200, "application/json", out);
   });
 
-  // P2-1: OTA
-  AsyncElegantOTA.begin(&server);
+  // // ElegantOTA setup
+  // ElegantOTA.begin(&server);    // Start ElegantOTA
+  // ElegantOTA.setAuth("admin", "admin"); // Optional: uncomment to password protect OTA));
 
-  server.begin();
-  Serial.println(F("[HTTP] server started"));
-  Serial.println(F("[OTA]  /update"));
-
-  // Send boot alert
   sendAlert(ALERT_BOOT);
 }
 
 // ====== Loop ======
 void loop() {
+  server.handleClient();
+  // ElegantOTA.loop();       //Elegant OTA added
   updateDhtCache();
   checkWifiReconnect();
-  AsyncElegantOTA.loop();
+  updateStatusLed();
+  checkScheduledReboot();
 
-  // P3-1: MQTT maintenance
+  // MQTT maintenance
   if (mqttEnabled) {
     if (!mqtt.connected()) {
       if (mqttConnectedNow) {
@@ -1910,6 +2397,11 @@ void loop() {
     }
   }
 
+  // InfluxDB push
+  if (influxEnabled) {
+    pushToInflux();
+  }
+
   // Auto watering logic
   if (autoMode) {
     bool inWindow = isWithinWateringWindow();
@@ -1921,19 +2413,16 @@ void loop() {
       onPumpTurnedOn();
       digitalWrite(RELAY_PIN, LOW);
       sendAlert(ALERT_WATERING_START);
-      Serial.printf("[Auto] Water ON (Moisture: %.1f%% < %.1f%%)\n", moisture, moistureThreshold);
     } else if (!canWater && watering) {
       onPumpTurnedOff();
       watering = false;
       digitalWrite(RELAY_PIN, HIGH);
       sendAlert(ALERT_WATERING_STOP);
-      Serial.println(F("[Auto] Water OFF (conditions changed)"));
     } else if (moisture >= (moistureThreshold + 5.0f) && watering) {
       onPumpTurnedOff();
       watering = false;
       digitalWrite(RELAY_PIN, HIGH);
       sendAlert(ALERT_WATERING_STOP);
-      Serial.printf("[Auto] Water OFF (Moisture: %.1f%%)\n", moisture);
     }
   }
 
@@ -1944,7 +2433,6 @@ void loop() {
     autoMode = false;
     safetyTrip = true;
     digitalWrite(RELAY_PIN, HIGH);
-    Serial.println(F("[SAFETY] Max watering time exceeded!"));
     sendAlert(ALERT_SAFETY_TRIP);
     saveConfigToNvs();
   }

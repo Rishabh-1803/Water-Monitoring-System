@@ -50,7 +50,7 @@ textarea.input{font-family:monospace;font-size:11px}
 .danger-box{background:#f8d7da;border:1px solid #f1aeb5;color:#58151c;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 .info-box{background:#d1ecf1;border:1px solid #bee5eb;color:#0c5460;padding:10px;border-radius:8px;margin:8px 0;font-size:13px}
 .chart-container{position:relative;height:300px}
-.muted{opacity:.6;font-size:11px}
+.log-viewer{background:#1e1e1e;color:#d4d4d4;padding:12px;border-radius:8px;font-family:monospace;font-size:11px;max-height:300px;overflow-y:auto;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -58,7 +58,7 @@ textarea.input{font-family:monospace;font-size:11px}
 
   <header>
     <h1>Smart Agricultural System</h1>
-    <div class="small">ESP32-S3 • DHT11 + Soil Moisture + Relay • Weather + Trends + MQTT + Alerts + OTA</div>
+    <div class="small">ESP32-S3 • Cloud + Hardening • Weather + Trends + MQTT + Alerts + HTTPS + InfluxDB + OTA</div>
     <div class="small" id="clock" style="margin-top:4px">—</div>
   </header>
 
@@ -149,14 +149,27 @@ textarea.input{font-family:monospace;font-size:11px}
     <div class="kv"><span>WiFi RSSI</span><span id="diag-rssi">—</span></div>
     <div class="kv"><span>WiFi SSID</span><span id="diag-ssid">—</span></div>
     <div class="kv"><span>IP Address</span><span id="diag-ip">—</span></div>
+    <div class="kv"><span>HTTPS Port</span><span id="diag-https">—</span></div>
     <div class="kv"><span>LittleFS Used</span><span id="diag-fs">—</span></div>
     <div class="kv"><span>MQTT Status</span><span id="diag-mqtt">—</span></div>
+    <div class="kv"><span>InfluxDB Status</span><span id="diag-influx">—</span></div>
     <div class="kv"><span>Pump Cycles</span><span id="diag-cycles">—</span></div>
     <div class="kv"><span>Pump Total Runtime</span><span id="diag-runtime">—</span></div>
+    <div class="kv"><span>LED State</span><span id="diag-led">—</span></div>
     <div class="kv"><span>Last Boot</span><span id="diag-boot">—</span></div>
+    <div class="kv"><span>Scheduled Reboot</span><span id="diag-sched">—</span></div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-primary" id="diag-refresh">Refresh</button>
       <button class="btn btn-warn" id="diag-reboot">Reboot Device</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Access Log (last 50 events)</h2>
+    <div class="log-viewer" id="access-log">Loading...</div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-primary" id="refresh-logs">Refresh Logs</button>
+      <button class="btn btn-warn" id="clear-logs">Clear Logs</button>
     </div>
   </div>
 
@@ -182,7 +195,26 @@ textarea.input{font-family:monospace;font-size:11px}
         <input id="water-end-hour" class="input" type="number" step="1" min="0" max="23" />
       </div>
     </div>
-    <div class="notice">If start == end, watering is allowed any time.</div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Scheduled Reboot</label>
+        <select id="sched-reboot-enabled" class="input">
+          <option value="false">Disabled</option>
+          <option value="true">Enabled</option>
+        </select>
+      </div>
+      <div>
+        <label>Reboot Day (0=Sun, 6=Sat)</label>
+        <input id="sched-reboot-day" class="input" type="number" step="1" min="0" max="6" />
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Reboot Hour (0-23)</label>
+        <input id="sched-reboot-hour" class="input" type="number" step="1" min="0" max="23" />
+      </div>
+      <div></div>
+    </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-settings">Save</button>
     </div>
@@ -229,17 +261,26 @@ textarea.input{font-family:monospace;font-size:11px}
         <input id="cfg-auth-pass" class="input" type="password" placeholder="••••••" />
       </div>
       <div>
+        <label>Enable HTTPS (port 443)</label>
+        <select id="cfg-https-enabled" class="input">
+          <option value="false">Disabled (HTTP only)</option>
+          <option value="true">Enabled (self-signed cert)</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
         <label>Validate TLS Cert (advanced)</label>
         <select id="cfg-tls-validate" class="input">
           <option value="false">Disabled (insecure, default)</option>
           <option value="true">Enabled (paste root CA below)</option>
         </select>
       </div>
+      <div></div>
     </div>
     <div style="margin-top:10px">
       <label>Root CA Certificate (PEM format, optional)</label>
-      <textarea id="cfg-root-ca" class="input" rows="4" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
-      <div class="notice">Get the cert with: <code>openssl s_client -showcerts -connect api.openweathermap.org:443 &lt;/dev/null 2&gt;/dev/null | openssl x509 -outform PEM</code></div>
+      <textarea id="cfg-root-ca" class="input" rows="3" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
     </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-config">Save Configuration</button>
@@ -247,6 +288,15 @@ textarea.input{font-family:monospace;font-size:11px}
       <a class="btn btn-primary" href="/update" target="_blank">OTA Update</a>
       <button class="btn btn-primary" id="backup-config">Backup Config</button>
       <button class="btn btn-warn" id="restore-config">Restore Config</button>
+      <button class="btn btn-danger" id="factory-reset">Factory Reset</button>
+    </div>
+    <div class="warn-box" style="margin-top:10px">
+      <strong>HTTPS:</strong> Self-signed cert. Browser will warn — click "Advanced → Proceed" to continue.
+      <div class="small">Cert fingerprint: <code id="https-fingerprint">—</code></div>
+    </div>
+    <div class="danger-box" style="margin-top:8px">
+      <strong>Factory Reset:</strong> Wipes ALL data (NVS, LittleFS, WiFi config, sensor logs).
+      Device reboots into captive portal. Use only as last resort.
     </div>
   </div>
 
@@ -262,7 +312,7 @@ textarea.input{font-family:monospace;font-size:11px}
       </div>
       <div>
         <label>Broker Host</label>
-        <input id="cfg-mqtt-broker" class="input" type="text" placeholder="broker.hivemq.com or 192.168.1.50" />
+        <input id="cfg-mqtt-broker" class="input" type="text" placeholder="broker.hivemq.com" />
       </div>
     </div>
     <div class="form-row" style="margin-top:10px">
@@ -306,20 +356,56 @@ textarea.input{font-family:monospace;font-size:11px}
       </div>
       <div>
         <label>Chat ID</label>
-        <input id="cfg-tg-chat" class="input" type="text" placeholder="e.g. 123456789" />
+        <input id="cfg-tg-chat" class="input" type="text" placeholder="123456789" />
       </div>
     </div>
     <div style="margin-top:10px">
       <label>Bot Token</label>
-      <input id="cfg-tg-token" class="input" type="text" placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ" />
+      <input id="cfg-tg-token" class="input" type="text" placeholder="123456789:ABCdef..." />
     </div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-success" id="save-telegram">Save Telegram Config</button>
       <button class="btn btn-primary" id="test-telegram">Send Test Alert</button>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>InfluxDB Cloud (v2)</h2>
+    <div class="form-row">
+      <div>
+        <label>Enable InfluxDB</label>
+        <select id="cfg-influx-enabled" class="input">
+          <option value="false">Disabled</option>
+          <option value="true">Enabled</option>
+        </select>
+      </div>
+      <div>
+        <label>Bucket</label>
+        <input id="cfg-influx-bucket" class="input" type="text" placeholder="smartfarm" />
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:10px">
+      <div>
+        <label>Organization</label>
+        <input id="cfg-influx-org" class="input" type="text" placeholder="your-email@example.com" />
+      </div>
+      <div></div>
+    </div>
+    <div style="margin-top:10px">
+      <label>InfluxDB URL</label>
+      <input id="cfg-influx-url" class="input" type="text" placeholder="https://eu-central-1-1.aws.cloud2.influxdata.com" />
+    </div>
+    <div style="margin-top:10px">
+      <label>API Token</label>
+      <input id="cfg-influx-token" class="input" type="password" placeholder="your-influx-token-here" />
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-success" id="save-influx">Save InfluxDB Config</button>
+      <button class="btn btn-primary" id="test-influx">Send Test Point</button>
+    </div>
     <div class="notice">
-      Create a bot via <a href="https://t.me/BotFather" target="_blank">@BotFather</a> to get a token.
-      Message <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a> to get your Chat ID.
+      Pushes sensor data every 60s using <a href="https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/" target="_blank">line protocol</a>.
+      Get a free account at <a href="https://cloud2.influxdata.com" target="_blank">cloud2.influxdata.com</a>.
     </div>
   </div>
 
@@ -327,7 +413,6 @@ textarea.input{font-family:monospace;font-size:11px}
 
 <script>
 const CSRF_HEADER = {'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'};
-
 const $ = id => document.getElementById(id);
 
 const temperatureEl = $('temperature'), humidityEl = $('humidity'), moistureEl = $('moisture');
@@ -340,9 +425,9 @@ const waterStartInp = $('water-start-hour'), waterEndInp = $('water-end-hour');
 const saveBtn = $('save-settings');
 const cfgApiKey = $('cfg-api-key'), cfgCity = $('cfg-city'), cfgCountry = $('cfg-country');
 const cfgAuthUser = $('cfg-auth-user'), cfgAuthPass = $('cfg-auth-pass');
-const cfgTlsValidate = $('cfg-tls-validate'), cfgRootCa = $('cfg-root-ca');
+const cfgHttpsEnabled = $('cfg-https-enabled'), cfgTlsValidate = $('cfg-tls-validate'), cfgRootCa = $('cfg-root-ca');
 const saveCfgBtn = $('save-config'), resetWifiBtn = $('reset-wifi');
-const backupBtn = $('backup-config'), restoreBtn = $('restore-config');
+const backupBtn = $('backup-config'), restoreBtn = $('restore-config'), factoryResetBtn = $('factory-config-reset') || $('factory-reset');
 const safetyWarn = $('safety-warn'), defaultCredsWarn = $('default-creds-warn');
 const faultWarn = $('fault-warn'), faultDetail = $('fault-detail');
 const tempFaultBadge = $('temp-fault'), humFaultBadge = $('hum-fault'), moistFaultBadge = $('moist-fault');
@@ -351,6 +436,8 @@ const calibDryBtn = $('calib-dry-btn'), calibWetBtn = $('calib-wet-btn'), calibR
 const refreshChartBtn = $('refresh-chart');
 const diagRefresh = $('diag-refresh'), diagReboot = $('diag-reboot');
 const saveMqttBtn = $('save-mqtt'), saveTelegramBtn = $('save-telegram'), testTelegramBtn = $('test-telegram');
+const saveInfluxBtn = $('save-influx'), testInfluxBtn = $('test-influx');
+const refreshLogsBtn = $('refresh-logs'), clearLogsBtn = $('clear-logs');
 let trendsChart = null;
 let moistureThreshold = 30, humidityThreshold = 50;
 
@@ -403,6 +490,9 @@ function loadSettings(){
     humInp.value = humidityThreshold;
     waterStartInp.value = s.watering_start_hour ?? 6;
     waterEndInp.value = s.watering_end_hour ?? 8;
+    $('sched-reboot-enabled').value = s.scheduled_reboot_enabled ? 'true' : 'false';
+    $('sched-reboot-day').value = s.scheduled_reboot_weekday ?? 1;
+    $('sched-reboot-hour').value = s.scheduled_reboot_hour ?? 3;
   }).catch(()=>{});
 }
 
@@ -411,7 +501,10 @@ function saveSettings(){
     moisture_threshold: parseFloat(moistInp.value||30),
     humidity_threshold: parseFloat(humInp.value||50),
     watering_start_hour: parseInt(waterStartInp.value||0),
-    watering_end_hour: parseInt(waterEndInp.value||0)
+    watering_end_hour: parseInt(waterEndInp.value||0),
+    scheduled_reboot_enabled: $('sched-reboot-enabled').value === 'true',
+    scheduled_reboot_weekday: parseInt($('sched-reboot-day').value||1),
+    scheduled_reboot_hour: parseInt($('sched-reboot-hour').value||3)
   };
   fetch('/settings',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
     .then(r=>r.json()).then(_=>loadSettings()).catch(()=>{});
@@ -437,23 +530,26 @@ function loadConfig(){
     cfgCountry.value = c.country || '';
     cfgAuthUser.value = c.auth_user || 'admin';
     cfgAuthPass.value = '';
+    cfgHttpsEnabled.value = c.https_enabled ? 'true' : 'false';
     cfgTlsValidate.value = c.validate_tls_cert ? 'true' : 'false';
     cfgRootCa.value = c.root_ca || '';
+    if (c.https_fingerprint) $('https-fingerprint').textContent = c.https_fingerprint;
     if (c.auth_user === 'admin' && c.using_default_pass) defaultCredsWarn.style.display = 'block';
     else defaultCredsWarn.style.display = 'none';
-
-    // MQTT
     $('cfg-mqtt-enabled').value = c.mqtt_enabled ? 'true' : 'false';
     $('cfg-mqtt-broker').value = c.mqtt_broker || '';
     $('cfg-mqtt-port').value = c.mqtt_port || 1883;
     $('cfg-mqtt-prefix').value = c.mqtt_prefix || 'smartfarm';
     $('cfg-mqtt-user').value = c.mqtt_user || '';
     $('cfg-mqtt-pass').value = '';
-
-    // Telegram
     $('cfg-tg-enabled').value = c.telegram_enabled ? 'true' : 'false';
     $('cfg-tg-chat').value = c.telegram_chat_id || '';
     $('cfg-tg-token').value = c.telegram_bot_token || '';
+    $('cfg-influx-enabled').value = c.influx_enabled ? 'true' : 'false';
+    $('cfg-influx-url').value = c.influx_url || '';
+    $('cfg-influx-org').value = c.influx_org || '';
+    $('cfg-influx-bucket').value = c.influx_bucket || 'smartfarm';
+    $('cfg-influx-token').value = c.influx_token || '';
   }).catch(()=>{});
 }
 
@@ -464,13 +560,28 @@ function saveConfig(){
     country: cfgCountry.value.toUpperCase(),
     auth_user: cfgAuthUser.value,
     validate_tls_cert: cfgTlsValidate.value === 'true',
-    root_ca: cfgRootCa.value
+    root_ca: cfgRootCa.value,
+    https_enabled: cfgHttpsEnabled.value === 'true',
+    mqtt_enabled: $('cfg-mqtt-enabled').value === 'true',
+    mqtt_broker: $('cfg-mqtt-broker').value,
+    mqtt_port: parseInt($('cfg-mqtt-port').value || 1883),
+    mqtt_prefix: $('cfg-mqtt-prefix').value || 'smartfarm',
+    mqtt_user: $('cfg-mqtt-user').value,
+    telegram_enabled: $('cfg-tg-enabled').value === 'true',
+    telegram_chat_id: $('cfg-tg-chat').value,
+    telegram_bot_token: $('cfg-tg-token').value,
+    influx_enabled: $('cfg-influx-enabled').value === 'true',
+    influx_url: $('cfg-influx-url').value,
+    influx_org: $('cfg-influx-org').value,
+    influx_bucket: $('cfg-influx-bucket').value || 'smartfarm',
+    influx_token: $('cfg-influx-token').value
   };
   if (cfgAuthPass.value) body.auth_pass = cfgAuthPass.value;
+  if ($('cfg-mqtt-pass').value) body.mqtt_pass = $('cfg-mqtt-pass').value;
   fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
       if (d.success) {
-        alert('Configuration saved.');
+        alert('Configuration saved.' + (d.https_changed ? ' HTTPS server will start/stop on next reboot.' : ''));
         if (d.rebuild_url) setTimeout(fetchWeather, 1500);
         loadConfig();
       } else alert('Failed: ' + (d.error || 'unknown'));
@@ -487,7 +598,6 @@ function resetWifi(){
 saveCfgBtn.onclick = saveConfig;
 resetWifiBtn.onclick = resetWifi;
 
-// Backup / Restore
 backupBtn.onclick = ()=>{
   fetch('/backup').then(r=>r.json()).then(data=>{
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
@@ -520,7 +630,14 @@ restoreBtn.onclick = ()=>{
   input.click();
 };
 
-// MQTT
+factoryResetBtn.onclick = ()=>{
+  if (!confirm('FACTORY RESET will erase ALL data (NVS, LittleFS, logs, WiFi). Device will reboot into captive portal. Are you sure?')) return;
+  if (!confirm('This is your final warning. Continue with factory reset?')) return;
+  fetch('/factory-reset',{method:'POST',headers:CSRF_HEADER})
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('Factory reset complete. Rebooting...'); })
+    .catch(()=>{});
+};
+
 saveMqttBtn.onclick = ()=>{
   const body = {
     mqtt_enabled: $('cfg-mqtt-enabled').value === 'true',
@@ -531,13 +648,10 @@ saveMqttBtn.onclick = ()=>{
   };
   if ($('cfg-mqtt-pass').value) body.mqtt_pass = $('cfg-mqtt-pass').value;
   fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
-    .then(r=>r.json()).then(d=>{
-      if (d.success) alert('MQTT config saved.');
-      else alert('Failed: ' + (d.error || 'unknown'));
-    }).catch(()=>{ alert('Network error'); });
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('MQTT config saved.'); else alert('Failed: ' + (d.error || 'unknown')); })
+    .catch(()=>{ alert('Network error'); });
 };
 
-// Telegram
 saveTelegramBtn.onclick = ()=>{
   const body = {
     telegram_enabled: $('cfg-tg-enabled').value === 'true',
@@ -545,21 +659,39 @@ saveTelegramBtn.onclick = ()=>{
     telegram_bot_token: $('cfg-tg-token').value
   };
   fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
-    .then(r=>r.json()).then(d=>{
-      if (d.success) alert('Telegram config saved.');
-      else alert('Failed: ' + (d.error || 'unknown'));
-    }).catch(()=>{ alert('Network error'); });
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('Telegram config saved.'); else alert('Failed: ' + (d.error || 'unknown')); })
+    .catch(()=>{ alert('Network error'); });
 };
 
 testTelegramBtn.onclick = ()=>{
   fetch('/telegram/test',{method:'POST',headers:CSRF_HEADER})
     .then(r=>r.json()).then(d=>{
-      if (d.success) alert('Test alert sent. Check your Telegram.');
+      if (d.success) alert('Test alert sent.');
       else alert('Failed: ' + (d.error || 'unknown'));
     }).catch(()=>{ alert('Network error'); });
 };
 
-// Calibration
+saveInfluxBtn.onclick = ()=>{
+  const body = {
+    influx_enabled: $('cfg-influx-enabled').value === 'true',
+    influx_url: $('cfg-influx-url').value,
+    influx_org: $('cfg-influx-org').value,
+    influx_bucket: $('cfg-influx-bucket').value || 'smartfarm',
+    influx_token: $('cfg-influx-token').value
+  };
+  fetch('/config',{method:'POST',headers:CSRF_HEADER,body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{ if (d.success) alert('InfluxDB config saved.'); else alert('Failed: ' + (d.error || 'unknown')); })
+    .catch(()=>{ alert('Network error'); });
+};
+
+testInfluxBtn.onclick = ()=>{
+  fetch('/influx/test',{method:'POST',headers:CSRF_HEADER})
+    .then(r=>r.json()).then(d=>{
+      if (d.success) alert('Test point sent. Check your InfluxDB bucket.');
+      else alert('Failed: ' + (d.error || 'unknown'));
+    }).catch(()=>{ alert('Network error'); });
+};
+
 function loadCalibration(){
   fetch('/calibrate').then(r=>r.json()).then(c=>{
     calibDry.textContent = c.dry ?? '—';
@@ -577,7 +709,6 @@ calibDryBtn.onclick = ()=>setCalibration('set_dry');
 calibWetBtn.onclick = ()=>setCalibration('set_wet');
 calibRefresh.onclick = ()=>{ updateSensorData(); loadCalibration(); };
 
-// Chart
 function fetchAndRenderChart(){
   fetch('/history?hours=24').then(r=>r.json()).then(data=>{
     const labels = data.map(p => p.t);
@@ -599,19 +730,22 @@ function fetchAndRenderChart(){
 }
 refreshChartBtn.onclick = fetchAndRenderChart;
 
-// Diagnostics
 function updateDiagnostics(){
   fetch('/diagnostics').then(r=>r.json()).then(d=>{
-    $('diag-uptime').textContent = d.uptime || '—';
+    $('diag-uptime').textContent = d.uptime ? `${Math.floor(d.uptime/3600)}h ${Math.floor((d.uptime%3600)/60)}m ${d.uptime%60}s` : '—';
     $('diag-heap').textContent = d.free_heap ? `${(d.free_heap/1024).toFixed(1)} KB` : '—';
     $('diag-rssi').textContent = (typeof d.rssi === 'number') ? `${d.rssi} dBm` : '—';
     $('diag-ssid').textContent = d.ssid || '—';
     $('diag-ip').textContent = d.ip || '—';
+    $('diag-https').textContent = d.https_enabled ? `Enabled (port 443)` : 'Disabled';
     $('diag-fs').textContent = d.fs_used ? `${(d.fs_used/1024).toFixed(0)} / ${(d.fs_total/1024).toFixed(0)} KB` : '—';
     $('diag-mqtt').textContent = d.mqtt_enabled ? (d.mqtt_connected ? 'Connected' : 'Disconnected') : 'Disabled';
+    $('diag-influx').textContent = d.influx_enabled ? 'Enabled' : 'Disabled';
     $('diag-cycles').textContent = d.pump_cycles ?? '—';
     $('diag-runtime').textContent = d.pump_runtime_sec ? `${Math.floor(d.pump_runtime_sec/60)} min ${d.pump_runtime_sec%60} s` : '—';
+    $('diag-led').textContent = d.led_state || '—';
     $('diag-boot').textContent = d.last_boot || '—';
+    $('diag-sched').textContent = d.scheduled_reboot_enabled ? `Every ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.scheduled_reboot_weekday]} at ${String(d.scheduled_reboot_hour).padStart(2,'0')}:00` : 'Disabled';
   }).catch(()=>{});
 }
 diagRefresh.onclick = updateDiagnostics;
@@ -622,12 +756,25 @@ diagReboot.onclick = ()=>{
   }).catch(()=>{});
 };
 
+function refreshLogs(){
+  fetch('/logs').then(r=>r.text()).then(t=>{
+    $('access-log').textContent = t || '(no log entries)';
+  }).catch(()=>{ $('access-log').textContent = 'Failed to load logs'; });
+}
+refreshLogsBtn.onclick = refreshLogs;
+clearLogsBtn.onclick = ()=>{
+  if (!confirm('Clear all access log entries?')) return;
+  fetch('/logs/clear',{method:'POST',headers:CSRF_HEADER}).then(r=>r.json()).then(d=>{
+    if (d.success) refreshLogs();
+  }).catch(()=>{});
+};
+
 function updateClock(){ fetch('/time').then(r=>r.json()).then(d=>{ clockEl.textContent = d.time || '—'; }).catch(()=>{}); }
 
 function init(){
   loadSettings(); loadConfig(); loadCalibration();
   updateSensorData(); updateSystemStatus(); fetchWeather();
-  fetchAndRenderChart(); updateClock(); updateDiagnostics();
+  fetchAndRenderChart(); updateClock(); updateDiagnostics(); refreshLogs();
   setInterval(()=>{ updateSensorData(); updateSystemStatus(); }, 5000);
   setInterval(()=>{ fetchWeather(); }, 600000);
   setInterval(()=>{ updateClock(); }, 30000);

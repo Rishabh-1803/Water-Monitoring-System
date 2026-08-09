@@ -13,6 +13,7 @@ This document lists the hardware components used in the ESP32-S3-based IoT Water
 | 7       | DC-DC Converter           | 12V to 5V Buck Converter                        |
 | 8       | Connecting Wires          | Male-to-Male / Male-to-Female Jumper Wires      |
 | 9       | Breadboard                | Standard Breadboard                             |
+| 10      | Status LED (optional, P4) | LED + 220Ω resistor (or use built-in LED on GPIO 2) |
 
 All components are selected to ensure low cost, easy availability, and suitability for educational and academic purposes.
 

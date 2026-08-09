@@ -21,6 +21,7 @@ This document describes the pin connections between the **ESP32-S3** development
 | Soil Moisture Sensor   | GPIO 1    | Analog Input    | Reads soil moisture level                    | ADC1_CH0 on ESP32-S3 — valid analog pin               |
 | DHT Sensor (Data)      | GPIO 4    | Digital I/O     | Reads temperature and humidity data          | ADC1_CH3 on ESP32-S3 (also usable as digital)         |
 | Relay Module (IN)      | GPIO 8    | Digital Output  | Controls solenoid valve ON/OFF               | Safe general-purpose output on ESP32-S3               |
+| Status LED (P4)        | GPIO 2    | Digital Output  | Indicates WiFi/MQTT/fault state via blink rate | Built-in LED on most S3 boards, or external LED + 220Ω |
 | Relay Module (VCC)     | 5V        | Power           | Power supply from DC-DC converter            |                                                        |
 | Relay Module (GND)     | GND       | Ground          | Common ground                                |                                                        |
 | Soil Sensor (VCC)      | 3.3V      | Power           | Power supply from ESP32                      |                                                        |
