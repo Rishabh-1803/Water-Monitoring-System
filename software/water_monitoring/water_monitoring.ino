@@ -139,6 +139,13 @@ unsigned long pumpStartTime = 0;
 unsigned long bootTime = 0;
 String lastBootTimeStr = "—";
 
+// ====== Credential Hygiene ======
+// Recomputed at boot and whenever credentials change. Exposed through
+// /diagnostics so a device still running on factory credentials shows up in
+// the dashboard instead of silently staying open to anyone on the LAN.
+bool usingDefaultCredentials = false;
+bool httpAuthDisabled = false;
+
 // ====== History Logging ======
 const char* LOG_FILE = "/log.csv";
 const char* ACCESS_LOG_FILE = "/access.log";
@@ -373,6 +380,7 @@ textarea.input{font-family:monospace;font-size:11px}
     <div class="kv"><span>LED State</span><span id="diag-led">—</span></div>
     <div class="kv"><span>Last Boot</span><span id="diag-boot">—</span></div>
     <div class="kv"><span>Scheduled Reboot</span><span id="diag-sched">—</span></div>
+    <div class="kv"><span>Credentials</span><span id="diag-creds">—</span></div>
     <div class="controls" style="margin-top:10px">
       <button class="btn btn-primary" id="diag-refresh">Refresh</button>
       <button class="btn btn-warn" id="diag-reboot">Reboot Device</button>
@@ -948,6 +956,10 @@ function updateDiagnostics(){
     $('diag-led').textContent = d.led_state || '—';
     $('diag-boot').textContent = d.last_boot || '—';
     $('diag-sched').textContent = d.scheduled_reboot_enabled ? `Every ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.scheduled_reboot_weekday]} at ${String(d.scheduled_reboot_hour).padStart(2,'0')}:00` : 'Disabled';
+    const credsEl = $('diag-creds');
+    if (d.auth_disabled) { credsEl.textContent = 'AUTH DISABLED'; credsEl.style.color = '#dc2626'; }
+    else if (d.default_credentials) { credsEl.textContent = 'Default admin/admin — change these'; credsEl.style.color = '#dc2626'; }
+    else { credsEl.textContent = 'Custom'; credsEl.style.color = ''; }
   }).catch(()=>{});
 }
 diagRefresh.onclick = updateDiagnostics;
@@ -1345,6 +1357,22 @@ bool requireAuthLogged(const String& action) {
     logAccess(entry);
   }
   return ok;
+}
+
+// ====== Credential hygiene ======
+// requireAuth() treats a blank username or password as 'no auth required',
+// so both that state and the untouched admin/admin default are worth
+// reporting rather than leaving silent.
+void checkCredentialHygiene() {
+  httpAuthDisabled = (authUser.length() == 0 || authPass.length() == 0);
+  usingDefaultCredentials = (authUser == "admin" && authPass == "admin");
+  if (httpAuthDisabled) {
+    Serial.println(F("[SECURITY] HTTP auth is DISABLED - every endpoint is open on the LAN."));
+    logAccess("WARNING: HTTP auth disabled (blank username or password)");
+  } else if (usingDefaultCredentials) {
+    Serial.println(F("[SECURITY] Default credentials admin/admin still in use - change them in Config."));
+    logAccess("WARNING: default credentials admin/admin still in use");
+  }
 }
 
 // ====== TLS-aware HTTPS client factory ======
@@ -1799,6 +1827,7 @@ void setup() {
 
   loadConfig();
   setupLittleFS();
+  checkCredentialHygiene();
 
   for (int i = 0; i < MAX_RATE_LIMIT_ENTRIES; i++) {
     rateLimits[i].ip = IPAddress(0, 0, 0, 0);
@@ -2025,6 +2054,7 @@ void setup() {
 
     if (urlNeedsRebuild) { buildWeatherURL(); lastWeatherUpdate = 0; lastForecastUpdate = 0; }
     saveConfigToNvs();
+    checkCredentialHygiene();
     if (mqttChanged) setupMqtt();
 
     DynamicJsonDocument res(128);
@@ -2096,7 +2126,7 @@ void setup() {
 
   server.on("/diagnostics", HTTP_GET, [](){
     if (!requireAuth()) return;
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(768);
     doc["uptime"] = (long)((millis() - bootTime) / 1000);
     doc["free_heap"] = (long)ESP.getFreeHeap();
     doc["rssi"] = WiFi.RSSI();
@@ -2114,6 +2144,8 @@ void setup() {
     doc["scheduled_reboot_enabled"] = scheduledRebootEnabled;
     doc["scheduled_reboot_weekday"] = scheduledRebootWeekday;
     doc["scheduled_reboot_hour"]    = scheduledRebootHour;
+    doc["default_credentials"]      = usingDefaultCredentials;
+    doc["auth_disabled"]            = httpAuthDisabled;
     String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
   });
