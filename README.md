@@ -36,7 +36,9 @@ See [`hardware/pin-connections.md`](hardware/pin-connections.md) for full wiring
 - Real-time soil moisture, temperature, and humidity monitoring
 - Auto-irrigation with 5% hysteresis
 - 5-minute max watering safety cutoff
-- WiFiManager captive portal, HTTPS for API calls, HTTP Basic Auth, CSRF protection
+- WiFiManager captive portal for WiFi provisioning (no credentials in source)
+- HTTP Basic Auth, CSRF protection and per-IP rate limiting on the local API
+- HTTPS for all *outbound* calls (weather, Telegram, InfluxDB)
 - Automatic WiFi reconnect
 
 ### Advanced (P2)
@@ -76,16 +78,18 @@ Install via Arduino IDE Library Manager:
 | Library | Author | Purpose |
 |---------|--------|---------|
 | ArduinoJson v6 | Benoit Blanchon | JSON parsing/serialization |
-| ESPAsyncWebServer | me-no-dev | Async HTTP server |
-| AsyncTCP | me-no-dev | Async TCP for ESP32 |
 | DHT sensor library | Adafruit | DHT11 driver |
-| WiFiManager | tzapu | Captive portal |
-| AsyncElegantOTA | Ayush Sharma | OTA firmware updates |
+| WiFiManager | tzapu | WiFi provisioning captive portal |
 | PubSubClient | Nick O'Leary | MQTT client |
 
-The following come bundled with the ESP32 board package:
-- `WiFi.h`, `WiFiClientSecure.h`, `HTTPClient.h`, `Preferences.h`, `ESPmDNS.h`, `LittleFS.h`, `time.h`
-- `mbedtls/*` (for HTTPS cert handling — new in P4)
+Only these four are needed. The firmware uses the **synchronous** `WebServer.h`
+and the core `Update.h`, both bundled with the ESP32 board package, so no async
+web server or async OTA library is required — that choice keeps RAM free for the
+TLS stack and the embedded dashboard.
+
+The following come bundled with the ESP32 board package and need no installation:
+- `WiFi.h`, `WiFiClientSecure.h`, `HTTPClient.h`, `Preferences.h`, `time.h`
+- `WebServer.h` (local HTTP server), `Update.h` (OTA), `ESPmDNS.h`, `LittleFS.h`
 
 ### Board Settings (Arduino IDE)
 
@@ -111,24 +115,40 @@ The status LED on GPIO 2 blinks at different rates to indicate system state:
 
 If your ESP32-S3 board has a built-in LED on GPIO 2 (most do), no extra wiring needed. Otherwise connect an external LED + 220Ω resistor between GPIO 2 and GND.
 
-## HTTPS Setup (P4-1)
+## Transport Security
 
-By default, the device serves HTTP on port 80. To enable HTTPS on port 443:
+Worth being precise about, because the two directions differ.
 
-1. Generate a self-signed certificate on your computer:
-   ```bash
-   openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
-     -subj "/CN=smartagri.local"
-   ```
-2. Open the web UI → Configuration card
-3. Set **Enable HTTPS** to `Enabled`
-4. Save and reboot the device
+**Outbound (device to internet): HTTPS.** Weather, forecast, Telegram and InfluxDB
+calls all go through `WiFiClientSecure`. Certificate validation is available but
+**off by default** — without a configured root CA the client falls back to
+`setInsecure()`, which encrypts the connection but does not verify the server. To
+turn validation on, paste the service's root CA into the Configuration card and set
+**Validate TLS Certificate** to `true`. Be aware that a pinned CA which later
+rotates will break telemetry until the device is reconfigured.
 
-After reboot, both servers run:
-- `http://project.local/` (port 80)
-- `https://project.local/` (port 443)
+**Inbound (browser to device): plain HTTP on port 80.** There is no HTTPS listener
+and no port 443. Basic Auth credentials therefore cross the LAN base64-encoded, not
+encrypted. This is a deliberate trade-off — terminating TLS handshakes on the same
+core that controls a solenoid valve costs RAM and adds latency to the control loop --
+but it means the dashboard should only be exposed on a network you trust, and the
+device should never be port-forwarded to the internet.
 
-The browser will warn about the self-signed cert — click "Advanced → Proceed" to continue. For production use, consider getting a real cert via Let's Encrypt with DNS challenge (requires external setup).
+The local API is instead defended in depth:
+
+| Control | Behaviour |
+|---|---|
+| HTTP Basic Auth | Required on every endpoint |
+| Rate limiting | 5 failed attempts per IP per minute, then a 60 s block (HTTP 429) |
+| CSRF | `X-Requested-With` header required on every state-changing POST |
+| Access log | Authenticated actions and rate-limit events appended to LittleFS |
+| Credential warning | Dashboard flags the `admin`/`admin` default in red |
+
+The CSRF control works because a browser will not attach a custom header to a
+cross-origin form post, and adding one to a `fetch()` forces a CORS preflight the
+device never approves. It depends on the header being registered with
+`server.collectHeaders()` during setup — `WebServer` silently discards any header
+not registered there.
 
 ## InfluxDB Cloud Setup (P4-2)
 
@@ -193,21 +213,36 @@ To prevent brute-force attacks on the HTTP Basic Auth:
 The auto-mode loop checks all of these conditions before turning the pump ON:
 
 1. Within the configured watering window
-2. No rain ≥ 1 mm forecast in next 3 hours
-3. Moisture sensor is healthy
-4. Soil moisture is below threshold (5% hysteresis)
-5. Max watering duration not exceeded
+2. No rain ≥ 1 mm forecast in the next 3 hours
+3. Moisture sensor is healthy (not in a fault state)
+4. Soil moisture is below the configured threshold
 
-If any condition becomes false mid-watering, the pump turns OFF immediately and a Telegram alert is sent.
+If conditions 1-3 stop holding mid-watering, the valve closes immediately and a
+Telegram alert is sent. Watering also stops once moisture reaches
+`threshold + 5%` — the hysteresis band that stops the relay chattering around the
+setpoint.
+
+The 5-minute maximum duration is **not** one of the four preconditions. It is a
+separate latching check that runs outside auto-mode, so it also covers a valve
+opened by hand from the dashboard. When it trips it closes the valve, disables auto
+mode, persists that state and alerts — it does not resume on its own.
 
 ## Security Notes
 
-- **No hardcoded secrets in source.** All credentials in NVS, configurable at runtime.
-- **HTTPS** for OpenWeatherMap and Telegram API calls (with optional cert validation).
-- **HTTPS on local web server** when enabled (self-signed cert).
-- **HTTP Basic Auth** on all routes. With HTTPS enabled, credentials travel encrypted.
-- **CSRF protection** on all POST endpoints.
-- **Rate limiting** prevents brute-force auth attacks.
-- **Access log** records all admin actions for audit.
-- **Default credentials are `admin`/`admin`** — change them immediately.
+- **No hardcoded secrets in source.** All credentials live in NVS and are set at runtime.
+- **HTTPS on all outbound calls** (weather, Telegram, InfluxDB), with optional root-CA
+  validation that is off by default.
+- **The local web server is HTTP only.** Basic Auth credentials are base64-encoded, not
+  encrypted, on the LAN. Do not expose this device to the internet.
+- **HTTP Basic Auth** on every route.
+- **CSRF protection** on every state-changing POST, via a required custom header.
+- **Rate limiting** blocks an IP for 60 s after 5 failed auth attempts in a minute.
+- **Access log** records authenticated actions and security events for audit.
+- **Default credentials are `admin`/`admin`** — change them immediately. The
+  Diagnostics card shows in red while the defaults are still in place.
+- **A blank username or password disables auth entirely.** The dashboard reports this
+  as `AUTH DISABLED`.
 - **Backup files contain plaintext secrets** — store them securely.
+
+A frank list of the design's limitations is kept in
+[`docs/system-architecture.md`](docs/system-architecture.md#10-known-limitations).
