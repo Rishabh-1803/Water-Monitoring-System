@@ -1,0 +1,11 @@
+# Office lock files
+~$*
+
+# Build / upload artifacts
+*.bin
+*.elf
+*.map
+
+# OS
+.DS_Store
+Thumbs.db
