@@ -1844,6 +1844,15 @@ void setup() {
   logAccess("Device booted");
   Serial.println(F("[HTTP] Web UI will be served on port 80 only (no local HTTPS)"));
 
+  // ====== Collected request headers ======
+  // WebServer only retains headers registered here; everything else is
+  // discarded during parsing. Without this call hasHeader("X-Requested-With")
+  // is always false, so requireCsrf() rejects every POST with 403 and the
+  // whole control surface (watering, settings, calibration, reboot) stops
+  // responding. This one line is what makes the CSRF check function.
+  static const char* COLLECTED_HEADERS[] = { "X-Requested-With" };
+  server.collectHeaders(COLLECTED_HEADERS, 1);
+
   // ====== Routes ======
   server.on("/", HTTP_GET, [](){
     if (!requireAuth()) return;
